@@ -1,72 +1,68 @@
 // @ts-nocheck
 import { useState } from "react";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { useToast } from "@/hooks/use-toast";
-import { useAuth } from "@/lib/auth";
 import { useLocation, Link } from "wouter";
-import { signupSchema, type SignupData } from "@shared/schema";
 
 export default function Signup() {
   const [, setLocation] = useLocation();
-  const { signup } = useAuth();
   const { toast } = useToast();
-  const [userType, setUserType] = useState<'user' | 'owner'>('user');
 
-  const form = useForm<SignupData>({
-    resolver: zodResolver(signupSchema),
-    defaultValues: {
-      firstName: "",
-      lastName: "",
-      email: "",
-      phone: "",
-      password: "",
-      confirmPassword: "",
-      userType: "user",
-    },
+  const [userType, setUserType] = useState<'user' | 'owner'>('user');
+  const [step, setStep] = useState<'details' | 'otp'>('details');
+  const [otp, setOtp] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const [formData, setFormData] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    phone: "",
   });
 
-  const onSubmit = async (data: SignupData) => {
+  const handleSignup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+
     try {
-      // Update userType in form data before submission
-      const formData = { ...data, userType };
-      
       const response = await fetch('/api/auth/signup', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({ ...formData, userType }),
       });
 
-      if (response.ok) {
-        const responseData = await response.json();
-        
-        // Store authentication data
-        localStorage.setItem('authToken', responseData.token);
-        localStorage.setItem('userType', userType);
-        localStorage.setItem('userEmail', data.email);
-        localStorage.setItem('user', JSON.stringify(responseData.user));
+      const responseData = await response.json();
 
-        toast({
-          title: "Account Created",
-          description: "Welcome to NestMatch! Your account has been created successfully.",
-        });
-        
-        // Redirect to appropriate dashboard
-        if (userType === 'owner') {
-          setLocation('/dashboard/owner');
+      if (response.ok) {
+        // If backend directly logs in after signup
+        if (responseData.token) {
+          localStorage.setItem('authToken', responseData.token);
+          localStorage.setItem('userType', userType);
+          localStorage.setItem('userEmail', formData.email);
+          localStorage.setItem('user', JSON.stringify(responseData.user));
+
+          toast({
+            title: "Account Created",
+            description: "Welcome to NestMatch! Your account has been created successfully.",
+          });
+
+          setLocation(userType === 'owner' ? '/dashboard/owner' : '/dashboard/user');
         } else {
-          setLocation('/dashboard/user');
+          // Move to OTP verification step
+          setStep('otp');
+          toast({
+            title: "OTP Sent",
+            description: `Please enter the verification code sent to ${formData.email}.`,
+          });
         }
       } else {
-        const errorData = await response.json();
-        throw new Error(errorData.message || 'Signup failed');
+        throw new Error(responseData.message || 'Signup failed');
       }
     } catch (error: any) {
       toast({
@@ -74,6 +70,53 @@ export default function Signup() {
         description: error.message || "Something went wrong",
         variant: "destructive",
       });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+
+    try {
+      const response = await fetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: formData.email,
+          otp,
+          userType,
+        }),
+      });
+
+      const responseData = await response.json();
+
+      if (response.ok) {
+        localStorage.setItem('authToken', responseData.token);
+        localStorage.setItem('userType', userType);
+        localStorage.setItem('userEmail', formData.email);
+        localStorage.setItem('user', JSON.stringify(responseData.user));
+
+        toast({
+          title: "Account Created",
+          description: "Welcome to NestMatch! Your account has been created successfully.",
+        });
+
+        setLocation(userType === 'owner' ? '/dashboard/owner' : '/dashboard/user');
+      } else {
+        throw new Error(responseData.message || 'Invalid OTP');
+      }
+    } catch (error: any) {
+      toast({
+        title: "Verification Failed",
+        description: error.message || "Invalid or expired OTP",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -86,7 +129,7 @@ export default function Signup() {
             Join thousands of satisfied users
           </p>
         </div>
-        
+
         <Card>
           <CardContent className="p-6">
             {/* User Type Selection */}
@@ -94,10 +137,7 @@ export default function Signup() {
               <Button
                 type="button"
                 variant={userType === 'user' ? 'default' : 'ghost'}
-                onClick={() => {
-                  setUserType('user');
-                  form.setValue('userType', 'user');
-                }}
+                onClick={() => setUserType('user')}
                 className="flex-1"
               >
                 I'm looking for PG
@@ -105,132 +145,127 @@ export default function Signup() {
               <Button
                 type="button"
                 variant={userType === 'owner' ? 'default' : 'ghost'}
-                onClick={() => {
-                  setUserType('owner');
-                  form.setValue('userType', 'owner');
-                }}
+                onClick={() => setUserType('owner')}
                 className="flex-1"
               >
                 I'm a PG Owner
               </Button>
             </div>
 
-            <Form {...form}>
-              <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            {step === 'details' ? (
+              <form onSubmit={handleSignup} className="space-y-4">
                 <div className="grid grid-cols-2 gap-4">
-                  <FormField
-                    control={form.control}
-                    name="firstName"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>First name</FormLabel>
-                        <FormControl>
-                          <Input {...field} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <FormField
-                    control={form.control}
-                    name="lastName"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Last name</FormLabel>
-                        <FormControl>
-                          <Input {...field} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
+                  <div className="space-y-2">
+                    <Label htmlFor="firstName">First name</Label>
+                    <Input
+                      id="firstName"
+                      value={formData.firstName}
+                      onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
+                      required
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lastName">Last name</Label>
+                    <Input
+                      id="lastName"
+                      value={formData.lastName}
+                      onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="email">Email address</Label>
+                  <Input
+                    id="email"
+                    type="email"
+                    value={formData.email}
+                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                    required
                   />
                 </div>
-                
-                <FormField
-                  control={form.control}
-                  name="email"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Email address</FormLabel>
-                      <FormControl>
-                        <Input type="email" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                
-                <FormField
-                  control={form.control}
-                  name="phone"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Phone number</FormLabel>
-                      <FormControl>
-                        <Input type="tel" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                
-                <FormField
-                  control={form.control}
-                  name="password"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Password</FormLabel>
-                      <FormControl>
-                        <Input type="password" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
 
-                <FormField
-                  control={form.control}
-                  name="confirmPassword"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Confirm Password</FormLabel>
-                      <FormControl>
-                        <Input type="password" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                <div className="space-y-2">
+                  <Label htmlFor="phone">Phone number</Label>
+                  <Input
+                    id="phone"
+                    type="tel"
+                    value={formData.phone}
+                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                    required
+                  />
+                </div>
 
                 <div className="flex items-center space-x-2">
                   <Checkbox id="terms" required />
                   <label htmlFor="terms" className="text-sm text-gray-900 dark:text-gray-100">
                     I agree to the{" "}
-                    <Button variant="link" className="p-0 h-auto text-primary">
+                    <Button type="button" variant="link" className="p-0 h-auto text-primary">
                       Terms of Service
                     </Button>{" "}
                     and{" "}
-                    <Button variant="link" className="p-0 h-auto text-primary">
+                    <Button type="button" variant="link" className="p-0 h-auto text-primary">
                       Privacy Policy
                     </Button>
                   </label>
                 </div>
 
-                <Button 
-                  type="submit" 
+                <Button
+                  type="submit"
                   className="w-full"
-                  disabled={form.formState.isSubmitting}
+                  disabled={isSubmitting}
                 >
-                  {form.formState.isSubmitting ? "Creating account..." : "Create account"}
+                  {isSubmitting ? "Creating account..." : "Create account"}
                 </Button>
               </form>
-            </Form>
+            ) : (
+              <form onSubmit={handleVerifyOtp} className="space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="otp">Enter Verification OTP</Label>
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="p-0 h-auto text-xs"
+                      onClick={() => {
+                        setStep('details');
+                        setOtp("");
+                      }}
+                    >
+                      Edit details
+                    </Button>
+                  </div>
+                  <Input
+                    id="otp"
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder="Enter 6-digit OTP"
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))}
+                    required
+                  />
+                  <p className="text-xs text-gray-500">
+                    OTP sent to {formData.email}
+                  </p>
+                </div>
+
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={isSubmitting || otp.length < 4}
+                >
+                  {isSubmitting ? "Verifying..." : "Verify & Complete Signup"}
+                </Button>
+              </form>
+            )}
 
             <div className="mt-6 text-center">
               <p className="text-sm text-gray-600 dark:text-gray-400">
                 Already have an account?{" "}
                 <Link href="/login">
-                  <Button variant="link" className="p-0 h-auto font-medium">
+                  <Button type="button" variant="link" className="p-0 h-auto font-medium">
                     Sign in
                   </Button>
                 </Link>

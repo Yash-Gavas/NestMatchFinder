@@ -2,12 +2,18 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { 
-  loginSchema, signupSchema, insertBookingSchema, insertPropertySchema, insertReviewSchema, insertFavoriteSchema
+import {
+  loginSchema,
+  insertBookingSchema,
+  insertPropertySchema,
+  insertReviewSchema,
+  insertFavoriteSchema,
 } from "@shared/schema";
 import jwt from "jsonwebtoken";
+import { generateOtpCode, sendOtpEmail } from "./email";
 
 const JWT_SECRET = process.env.JWT_SECRET || "nestmatch_secret_key";
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // Extend Express Request interface
 interface AuthenticatedRequest extends Request {
@@ -20,71 +26,132 @@ interface AuthenticatedRequest extends Request {
 
 // Authentication middleware
 const authenticateToken = (req: any, res: any, next: any) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
+    return res.status(401).json({ message: "Access token required" });
   }
 
   jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-    if (err) return res.status(403).json({ message: 'Invalid token' });
+    if (err) return res.status(403).json({ message: "Invalid token" });
     req.user = user;
     next();
   });
 };
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  // Auth routes
+  // In-memory OTP store (works without DB table; cleared on restart)
+  const otpStore = new Map<
+    string,
+    {
+      code: string;
+      expiresAt: number;
+      userType: string;
+      signupPayload?: {
+        firstName: string;
+        lastName: string;
+        email: string;
+        phone: string;
+        userType: "user" | "owner";
+      };
+    }
+  >();
+
+  // Passwordless OTP Signup: validates user info, sends OTP via Resend, and awaits /api/auth/verify-otp
   app.post("/api/auth/signup", async (req, res) => {
     try {
       console.log("Signup request body:", req.body);
-      const validatedData = signupSchema.parse(req.body);
-      console.log("Validation successful:", validatedData);
-      const { confirmPassword, ...userData } = validatedData;
+      const { firstName, lastName, email, phone, userType } = req.body || {};
 
-      // Check if user already exists
-      const existingUser = await storage.getUserByEmail(userData.email);
-      if (existingUser) {
-        console.log("Signup failed: User already exists", { email: userData.email, userType: userData.userType });
-        return res.status(400).json({ message: "User already exists" });
+      if (
+        !firstName ||
+        !String(firstName).trim() ||
+        !lastName ||
+        !String(lastName).trim() ||
+        !email ||
+        !String(email).trim() ||
+        !phone ||
+        !String(phone).trim() ||
+        (userType !== "user" && userType !== "owner")
+      ) {
+        return res.status(400).json({
+          message:
+            "First name, last name, email, phone, and userType ('user' or 'owner') are required",
+        });
       }
 
-      const user = await storage.createUser({
-        ...userData,
-        password: userData.password,
+      const normalized = String(email).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+        return res.status(400).json({ message: "Invalid email address" });
+      }
+
+      const existingUser = await storage.getUserByEmail(normalized);
+      if (existingUser) {
+        console.log("Signup failed: User already exists", {
+          email: normalized,
+          userType,
+        });
+        return res
+          .status(400)
+          .json({ message: "User already exists with this email" });
+      }
+
+      const code = generateOtpCode();
+      const expiresAt = Date.now() + OTP_TTL_MS;
+      const signupPayload = {
+        firstName: String(firstName).trim(),
+        lastName: String(lastName).trim(),
+        email: normalized,
+        phone: String(phone).trim(),
+        userType: userType as "user" | "owner",
+      };
+
+      otpStore.set(normalized, {
+        code,
+        expiresAt,
+        userType,
+        signupPayload,
       });
 
-      // Generate JWT token
-      const token = jwt.sign(
-        { id: user.id, email: user.email, userType: user.userType },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      try {
+        const { pool } = await import("./db");
+        await pool.query(
+          `CREATE TABLE IF NOT EXISTS otps (
+            id SERIAL PRIMARY KEY,
+            email TEXT NOT NULL,
+            code TEXT NOT NULL,
+            "expiresAt" TIMESTAMP NOT NULL,
+            "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )`
+        );
+        await pool.query(`DELETE FROM otps WHERE email = $1`, [normalized]);
+        await pool.query(
+          `INSERT INTO otps (email, code, "expiresAt") VALUES ($1, $2, to_timestamp($3 / 1000.0))`,
+          [normalized, code, expiresAt]
+        );
+      } catch (dbErr) {
+        console.log("OTP DB store skipped:", (dbErr as Error).message);
+      }
 
-      res.status(201).json({
-        message: "User created successfully",
-        user: { ...user, password: undefined },
-        token,
+      const result = await sendOtpEmail(normalized, code);
+      if (!result.ok) {
+        return res.status(502).json({
+          message: result.error || "Failed to send OTP email",
+          hint: "Check RESEND_API_KEY and that the from-domain is verified in Resend.",
+        });
+      }
+
+      return res.status(200).json({
+        message:
+          "OTP sent. Check your inbox — and your spam folder if this is the first time.",
+        email: normalized,
+        requiresOtp: true,
       });
     } catch (error: any) {
       console.error("Signup error:", error);
-      
-      // Handle Zod validation errors specifically
-      if (error.name === 'ZodError') {
-        return res.status(400).json({ 
-          message: "Invalid input data",
-          details: error.errors,
-          fieldErrors: error.errors.map((err: any) => ({
-            field: err.path.join('.'),
-            message: err.message
-          }))
-        });
-      }
-      
-      return res.status(400).json({ 
-        message: error.message || "Registration failed",
-        details: error.errors || null
+      return res.status(400).json({
+        message: error.message || "Invalid input data",
       });
     }
   });
@@ -93,25 +160,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       console.log("Login attempt:", req.body);
       const { email, password, userType } = req.body;
-      
+
       if (!email || !password || !userType) {
         return res.status(400).json({ message: "Missing required fields" });
       }
 
       const user = await storage.getUserByEmail(email);
-      console.log("User found:", user ? { id: user.id, email: user.email, userType: user.userType } : "No user found");
-      
+      console.log(
+        "User found:",
+        user
+          ? { id: user.id, email: user.email, userType: user.userType }
+          : "No user found"
+      );
+
       if (!user || user.userType !== userType) {
-        console.log("Login failed: User not found or wrong userType", { 
-          email, 
-          requestedUserType: userType, 
-          userExists: !!user, 
-          actualUserType: user?.userType 
+        console.log("Login failed: User not found or wrong userType", {
+          email,
+          requestedUserType: userType,
+          userExists: !!user,
+          actualUserType: user?.userType,
         });
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
-      const isValidPassword = password === user.password;
+      const isValidPassword = user.password && password === user.password;
       if (!isValidPassword) {
         console.log("Login failed: Invalid password for user:", email);
         return res.status(401).json({ message: "Invalid credentials" });
@@ -120,7 +192,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const token = jwt.sign(
         { id: user.id, email: user.email, userType: user.userType },
         JWT_SECRET,
-        { expiresIn: '24h' }
+        { expiresIn: "24h" }
       );
 
       res.json({
@@ -133,9 +205,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // In-memory OTP store (works without DB table; cleared on restart)
-  const otpStore = new Map<string, { code: string; expiresAt: number; userType: string }>();
-
   app.post("/api/auth/send-otp", async (req, res) => {
     try {
       const { email, userType = "user" } = req.body || {};
@@ -147,14 +216,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid email address" });
       }
 
-      const { generateOtpCode, sendOtpEmail } = await import("./email");
+      const existing = otpStore.get(normalized);
       const code = generateOtpCode();
-      const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+      const expiresAt = Date.now() + OTP_TTL_MS;
 
       otpStore.set(normalized, {
         code,
         expiresAt,
         userType: userType === "owner" ? "owner" : "user",
+        signupPayload: existing?.signupPayload,
       });
 
       try {
@@ -186,7 +256,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       res.json({
-        message: "OTP sent. Check your inbox — and your spam folder if this is the first time.",
+        message:
+          "OTP sent. Check your inbox — and your spam folder if this is the first time.",
         email: normalized,
       });
     } catch (error: any) {
@@ -197,12 +268,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/auth/verify-otp", async (req, res) => {
     try {
-      const { email, code, userType = "user" } = req.body || {};
-      if (!email || !code) {
+      const rawCode = req.body?.code ?? req.body?.otp;
+      const { email, userType = "user" } = req.body || {};
+      if (!email || !rawCode) {
         return res.status(400).json({ message: "Email and code are required" });
       }
       const normalized = String(email).trim().toLowerCase();
-      const entered = String(code).trim();
+      const entered = String(rawCode).trim();
 
       let stored = otpStore.get(normalized);
 
@@ -226,16 +298,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       if (!stored) {
-        return res.status(400).json({ message: "No OTP found. Please request a new code." });
+        return res
+          .status(400)
+          .json({ message: "No OTP found. Please request a new code." });
       }
       if (Date.now() > stored.expiresAt) {
         otpStore.delete(normalized);
-        return res.status(400).json({ message: "OTP expired. Please request a new code." });
+        return res
+          .status(400)
+          .json({ message: "OTP expired. Please request a new code." });
       }
       if (stored.code !== entered) {
-        return res.status(401).json({ message: "Invalid OTP. Please try again." });
+        return res
+          .status(401)
+          .json({ message: "Invalid OTP. Please try again." });
       }
 
+      const signupPayload = stored.signupPayload;
       otpStore.delete(normalized);
       try {
         const { pool } = await import("./db");
@@ -244,25 +323,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // ignore
       }
 
-      const role = userType === "owner" ? "owner" : stored.userType || "user";
+      const role =
+        userType === "owner"
+          ? "owner"
+          : signupPayload?.userType || stored.userType || "user";
+
       let user = await storage.getUserByEmail(normalized);
 
       if (!user) {
-        const localPart = normalized.split("@")[0] || "User";
+        const firstName =
+          signupPayload?.firstName || normalized.split("@")[0] || "User";
+        const lastName = signupPayload?.lastName || "";
+        const fullName = `${firstName} ${lastName}`.trim();
+
         user = await storage.createUser({
           email: normalized,
-          password: `otp_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-          firstName: localPart,
-          lastName: "",
-          name: localPart,
-          phone: "N/A",
+          password: null,
+          firstName,
+          lastName,
+          name: fullName,
+          phone: signupPayload?.phone || "N/A",
           userType: role,
           isVerified: true,
         } as any);
       } else if (!user.isVerified) {
         try {
           const { pool } = await import("./db");
-          await pool.query(`UPDATE users SET "isVerified" = true WHERE id = $1`, [user.id]);
+          await pool.query(
+            `UPDATE users SET "isVerified" = true WHERE id = $1`,
+            [user.id]
+          );
           user = { ...user, isVerified: true };
         } catch {
           // ignore
@@ -292,7 +382,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!user) {
         return res.status(404).json({ message: "User not found" });
       }
-      console.log(`User authenticated: ID ${user.id}, Email: ${user.email}, Type: ${user.userType}`);
+      console.log(
+        `User authenticated: ID ${user.id}, Email: ${user.email}, Type: ${user.userType}`
+      );
       res.json({ ...user, password: undefined });
     } catch (error) {
       res.status(500).json({ message: "Server error" });
@@ -303,7 +395,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/properties", async (req, res) => {
     try {
       const { city, minRent, maxRent, gender } = req.query;
-      
+
       if (city || minRent || maxRent || gender) {
         const properties = await storage.searchProperties({
           city: city as string,
@@ -334,47 +426,63 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/properties", authenticateToken, async (req: any, res: any) => {
-    try {
-      if (req.user.userType !== 'owner') {
-        return res.status(403).json({ message: "Only owners can create properties" });
+  app.post(
+    "/api/properties",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        if (req.user.userType !== "owner") {
+          return res
+            .status(403)
+            .json({ message: "Only owners can create properties" });
+        }
+
+        console.log("Creating property with data:", req.body);
+
+        const propertyData = insertPropertySchema.parse({
+          ...req.body,
+          ownerId: req.user.id,
+          isActive: true,
+          isVerified: true,
+        });
+
+        const property = await storage.createProperty(propertyData);
+        console.log("Property created successfully:", property.id);
+        res.status(201).json(property);
+      } catch (error) {
+        console.error("Property creation error:", error);
+        res.status(400).json({ message: "Invalid input", error });
       }
-
-      console.log("Creating property with data:", req.body);
-      
-      const propertyData = insertPropertySchema.parse({
-        ...req.body,
-        ownerId: req.user.id,
-        isActive: true,
-        isVerified: true, // Auto-approve for now
-      });
-
-      const property = await storage.createProperty(propertyData);
-      console.log("Property created successfully:", property.id);
-      res.status(201).json(property);
-    } catch (error) {
-      console.error("Property creation error:", error);
-      res.status(400).json({ message: "Invalid input", error });
     }
-  });
+  );
 
-  app.get("/api/properties/owner/:ownerId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const ownerId = parseInt(req.params.ownerId);
-      console.log(`Requested owner ID: ${ownerId}, User ID: ${req.user.id}, User email: ${req.user.email}`);
-      
-      if (req.user.id !== ownerId) {
-        return res.status(403).json({ message: "Access denied" });
+  app.get(
+    "/api/properties/owner/:ownerId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const ownerId = parseInt(req.params.ownerId);
+        console.log(
+          `Requested owner ID: ${ownerId}, User ID: ${req.user.id}, User email: ${req.user.email}`
+        );
+
+        if (req.user.id !== ownerId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const properties = await storage.getPropertiesByOwner(ownerId);
+        console.log(
+          `Fetching properties for owner ${ownerId}:`,
+          properties.length,
+          properties.map((p) => p.name)
+        );
+        res.json(properties);
+      } catch (error) {
+        console.error("Error fetching owner properties:", error);
+        res.status(500).json({ message: "Server error" });
       }
-
-      const properties = await storage.getPropertiesByOwner(ownerId);
-      console.log(`Fetching properties for owner ${ownerId}:`, properties.length, properties.map(p => p.name));
-      res.json(properties);
-    } catch (error) {
-      console.error("Error fetching owner properties:", error);
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   app.get("/api/properties/city/:city", async (req, res) => {
     try {
@@ -386,80 +494,95 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Update property route
-  app.put("/api/properties/:id", authenticateToken, async (req: any, res: any) => {
-    try {
-      const propertyId = parseInt(req.params.id);
-      const property = await storage.getProperty(propertyId);
-      
-      if (!property) {
-        return res.status(404).json({ message: "Property not found" });
-      }
-      
-      if (property.ownerId !== req.user.id) {
-        return res.status(403).json({ message: "Access denied" });
-      }
+  app.put(
+    "/api/properties/:id",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const propertyId = parseInt(req.params.id);
+        const property = await storage.getProperty(propertyId);
 
-      // Filter out fields that shouldn't be updated and problematic timestamp fields
-      const { id, ownerId, createdAt, isActive, isVerified, ...updateData } = req.body;
-      
-      const updatedProperty = await storage.updateProperty(propertyId, updateData);
-      if (!updatedProperty) {
-        return res.status(404).json({ message: "Property not found" });
+        if (!property) {
+          return res.status(404).json({ message: "Property not found" });
+        }
+
+        if (property.ownerId !== req.user.id) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const { id, ownerId, createdAt, isActive, isVerified, ...updateData } =
+          req.body;
+
+        const updatedProperty = await storage.updateProperty(
+          propertyId,
+          updateData
+        );
+        if (!updatedProperty) {
+          return res.status(404).json({ message: "Property not found" });
+        }
+
+        res.json(updatedProperty);
+      } catch (error) {
+        console.error("Property update error:", error);
+        res.status(400).json({ message: "Invalid input", error });
       }
-      
-      res.json(updatedProperty);
-    } catch (error) {
-      console.error("Property update error:", error);
-      res.status(400).json({ message: "Invalid input", error });
     }
-  });
+  );
 
   // Delete property route
-  app.delete("/api/properties/:id", authenticateToken, async (req: any, res: any) => {
-    try {
-      const propertyId = parseInt(req.params.id);
-      const property = await storage.getProperty(propertyId);
-      
-      if (!property) {
-        return res.status(404).json({ message: "Property not found" });
-      }
-      
-      if (property.ownerId !== req.user.id) {
-        return res.status(403).json({ message: "Access denied" });
-      }
+  app.delete(
+    "/api/properties/:id",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const propertyId = parseInt(req.params.id);
+        const property = await storage.getProperty(propertyId);
 
-      // Check if there are any active bookings for this property
-      const bookings = await storage.getBookingsByProperty(propertyId);
-      const activeBookings = bookings.filter(b => b.status === 'approved' || b.status === 'pending');
-      
-      if (activeBookings.length > 0) {
-        return res.status(400).json({ 
-          message: "Cannot delete property with active bookings. Please cancel all bookings first." 
-        });
-      }
+        if (!property) {
+          return res.status(404).json({ message: "Property not found" });
+        }
 
-      const success = await storage.deleteProperty(propertyId);
-      if (!success) {
-        return res.status(404).json({ message: "Property not found" });
+        if (property.ownerId !== req.user.id) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const bookings = await storage.getBookingsByProperty(propertyId);
+        const activeBookings = bookings.filter(
+          (b) => b.status === "approved" || b.status === "pending"
+        );
+
+        if (activeBookings.length > 0) {
+          return res.status(400).json({
+            message:
+              "Cannot delete property with active bookings. Please cancel all bookings first.",
+          });
+        }
+
+        const success = await storage.deleteProperty(propertyId);
+        if (!success) {
+          return res.status(404).json({ message: "Property not found" });
+        }
+
+        res.json({ message: "Property deleted successfully" });
+      } catch (error) {
+        console.error("Property deletion error:", error);
+        res.status(500).json({ message: "Server error" });
       }
-      
-      res.json({ message: "Property deleted successfully" });
-    } catch (error) {
-      console.error("Property deletion error:", error);
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   // Booking routes
   app.post("/api/bookings", authenticateToken, async (req: any, res: any) => {
     try {
       console.log("Booking creation attempt:", {
         user: req.user,
-        body: req.body
+        body: req.body,
       });
-      
-      if (req.user.userType !== 'user') {
-        return res.status(403).json({ message: "Only users can create bookings" });
+
+      if (req.user.userType !== "user") {
+        return res
+          .status(403)
+          .json({ message: "Only users can create bookings" });
       }
 
       const bookingData = insertBookingSchema.parse({
@@ -468,26 +591,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
 
       console.log("Parsed booking data:", bookingData);
-      
-      // Get the property to check availability and update beds
+
       const property = await storage.getProperty(bookingData.propertyId);
       if (!property) {
         return res.status(404).json({ message: "Property not found" });
       }
-      
+
       if (property.availableBeds <= 0) {
         return res.status(400).json({ message: "No beds available" });
       }
-      
-      // Create the booking
+
       const booking = await storage.createBooking(bookingData);
       console.log("Created booking:", booking);
-      
-      // Decrease available beds when booking is created (pending status)
+
       await storage.updateProperty(property.id, {
-        availableBeds: property.availableBeds - 1
+        availableBeds: property.availableBeds - 1,
       });
-      
+
       res.status(201).json(booking);
     } catch (error) {
       console.error("Booking creation error:", error);
@@ -495,78 +615,96 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.get("/api/bookings/user/:userId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const userId = parseInt(req.params.userId);
-      console.log("Getting bookings for user:", userId, "authenticated user:", req.user.id);
-      
-      if (req.user.id !== userId) {
-        return res.status(403).json({ message: "Access denied" });
+  app.get(
+    "/api/bookings/user/:userId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const userId = parseInt(req.params.userId);
+        console.log(
+          "Getting bookings for user:",
+          userId,
+          "authenticated user:",
+          req.user.id
+        );
+
+        if (req.user.id !== userId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const bookings = await storage.getBookingsByUser(userId);
+        console.log("Found bookings for user:", bookings);
+        res.json(bookings);
+      } catch (error) {
+        console.error("Error getting user bookings:", error);
+        res.status(500).json({ message: "Server error" });
       }
-
-      const bookings = await storage.getBookingsByUser(userId);
-      console.log("Found bookings for user:", bookings);
-      res.json(bookings);
-    } catch (error) {
-      console.error("Error getting user bookings:", error);
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
-  app.get("/api/bookings/owner/:ownerId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const ownerId = parseInt(req.params.ownerId);
-      console.log("Getting bookings for owner:", ownerId, "authenticated user:", req.user.id);
-      
-      if (req.user.id !== ownerId) {
-        return res.status(403).json({ message: "Access denied" });
+  app.get(
+    "/api/bookings/owner/:ownerId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const ownerId = parseInt(req.params.ownerId);
+        console.log(
+          "Getting bookings for owner:",
+          ownerId,
+          "authenticated user:",
+          req.user.id
+        );
+
+        if (req.user.id !== ownerId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const bookings = await storage.getBookingsByOwner(ownerId);
+        console.log("Found bookings for owner:", bookings);
+        res.json(bookings);
+      } catch (error) {
+        console.error("Error getting owner bookings:", error);
+        res.status(500).json({ message: "Server error" });
       }
-
-      const bookings = await storage.getBookingsByOwner(ownerId);
-      console.log("Found bookings for owner:", bookings);
-      res.json(bookings);
-    } catch (error) {
-      console.error("Error getting owner bookings:", error);
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   app.patch("/api/bookings/:id", authenticateToken, async (req: any, res: any) => {
     try {
       const bookingId = parseInt(req.params.id);
       const booking = await storage.getBooking(bookingId);
-      
+
       if (!booking) {
         return res.status(404).json({ message: "Booking not found" });
       }
 
-      // Check if user is owner of the property
       const property = await storage.getProperty(booking.propertyId);
       if (!property || property.ownerId !== req.user.id) {
         return res.status(403).json({ message: "Access denied" });
       }
 
-      // If booking is being approved, decrease available beds
-      if (req.body.status === 'approved' && booking.status !== 'approved') {
+      if (req.body.status === "approved" && booking.status !== "approved") {
         if (property.availableBeds > 0) {
           await storage.updateProperty(property.id, {
-            availableBeds: property.availableBeds - 1
+            availableBeds: property.availableBeds - 1,
           });
         } else {
-          return res.status(400).json({ message: "No available beds remaining" });
+          return res
+            .status(400)
+            .json({ message: "No available beds remaining" });
         }
       }
 
-      // If booking is being rejected after being approved, increase available beds
-      if (req.body.status === 'rejected' && booking.status === 'approved') {
+      if (req.body.status === "rejected" && booking.status === "approved") {
         await storage.updateProperty(property.id, {
-          availableBeds: property.availableBeds + 1
+          availableBeds: property.availableBeds + 1,
         });
       }
 
       const updatedBooking = await storage.updateBooking(bookingId, {
         ...req.body,
-        approvedDate: req.body.status === 'approved' ? new Date() : booking.approvedDate,
+        approvedDate:
+          req.body.status === "approved" ? new Date() : booking.approvedDate,
       });
 
       res.json(updatedBooking);
@@ -575,59 +713,66 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.delete("/api/bookings/:id", authenticateToken, async (req: any, res: any) => {
-    try {
-      const bookingId = parseInt(req.params.id);
-      const booking = await storage.getBooking(bookingId);
-      
-      if (!booking) {
-        return res.status(404).json({ message: "Booking not found" });
-      }
+  app.delete(
+    "/api/bookings/:id",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const bookingId = parseInt(req.params.id);
+        const booking = await storage.getBooking(bookingId);
 
-      // Check if user is the one who made the booking or owner of the property
-      const property = await storage.getProperty(booking.propertyId);
-      if (booking.userId !== req.user.id && (!property || property.ownerId !== req.user.id)) {
-        return res.status(403).json({ message: "Access denied" });
-      }
+        if (!booking) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
 
-      // Increase available beds only if the booking was approved (since we decrease them when booking is approved)
-      if (property && booking.status === 'approved') {
-        await storage.updateProperty(property.id, {
-          availableBeds: property.availableBeds + 1
-        });
-      }
+        const property = await storage.getProperty(booking.propertyId);
+        if (
+          booking.userId !== req.user.id &&
+          (!property || property.ownerId !== req.user.id)
+        ) {
+          return res.status(403).json({ message: "Access denied" });
+        }
 
-      const deleted = await storage.deleteBooking(bookingId);
-      if (deleted) {
-        res.json({ message: "Booking cancelled successfully" });
-      } else {
-        res.status(500).json({ message: "Failed to cancel booking" });
+        if (property && booking.status === "approved") {
+          await storage.updateProperty(property.id, {
+            availableBeds: property.availableBeds + 1,
+          });
+        }
+
+        const deleted = await storage.deleteBooking(bookingId);
+        if (deleted) {
+          res.json({ message: "Booking cancelled successfully" });
+        } else {
+          res.status(500).json({ message: "Failed to cancel booking" });
+        }
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   // Rating routes
   app.post("/api/ratings", authenticateToken, async (req: any, res: any) => {
     try {
-      if (req.user.userType !== 'user') {
-        return res.status(403).json({ message: "Only users can rate properties" });
+      if (req.user.userType !== "user") {
+        return res
+          .status(403)
+          .json({ message: "Only users can rate properties" });
       }
 
       const { propertyId, rating } = req.body;
-      
+
       if (!propertyId || !rating || rating < 1 || rating > 5) {
-        return res.status(400).json({ message: "Valid property ID and rating (1-5) required" });
+        return res
+          .status(400)
+          .json({ message: "Valid property ID and rating (1-5) required" });
       }
 
-      // Check if property exists
       const property = await storage.getProperty(propertyId);
       if (!property) {
         return res.status(404).json({ message: "Property not found" });
       }
 
-      // Create or update rating
       const ratingData = {
         userId: req.user.id,
         propertyId: parseInt(propertyId),
@@ -635,17 +780,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       const createdRating = await storage.createReview(ratingData);
-      
-      // Update property's average rating
+
       const allRatings = await storage.getReviewsByProperty(propertyId);
-      const avgRating = allRatings.reduce((sum, r) => sum + r.rating, 0) / allRatings.length;
-      
+      const avgRating =
+        allRatings.reduce((sum, r) => sum + r.rating, 0) / allRatings.length;
+
       await storage.updateProperty(propertyId, {
-        rating: (Math.round(avgRating * 10) / 10).toString(), // Convert to string for decimal field
-        reviewCount: allRatings.length
+        rating: (Math.round(avgRating * 10) / 10).toString(),
+        reviewCount: allRatings.length,
       });
 
-      res.json({ rating: createdRating.rating, message: "Rating submitted successfully" });
+      res.json({
+        rating: createdRating.rating,
+        message: "Rating submitted successfully",
+      });
     } catch (error) {
       console.error("Rating creation error:", error);
       res.status(500).json({ message: "Server error" });
@@ -653,19 +801,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Favorites routes
-  app.get("/api/favorites/user/:userId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const userId = parseInt(req.params.userId);
-      if (req.user.id !== userId) {
-        return res.status(403).json({ message: "Access denied" });
-      }
+  app.get(
+    "/api/favorites/user/:userId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const userId = parseInt(req.params.userId);
+        if (req.user.id !== userId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
 
-      const favorites = await storage.getFavoritesByUser(userId);
-      res.json(favorites);
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
+        const favorites = await storage.getFavoritesByUser(userId);
+        res.json(favorites);
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
+      }
     }
-  });
+  );
 
   app.post("/api/favorites", authenticateToken, async (req: any, res: any) => {
     try {
@@ -681,20 +833,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.delete("/api/favorites/:propertyId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const propertyId = parseInt(req.params.propertyId);
-      const deleted = await storage.deleteFavorite(req.user.id, propertyId);
-      
-      if (deleted) {
-        res.json({ message: "Favorite removed" });
-      } else {
-        res.status(404).json({ message: "Favorite not found" });
+  app.delete(
+    "/api/favorites/:propertyId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const propertyId = parseInt(req.params.propertyId);
+        const deleted = await storage.deleteFavorite(req.user.id, propertyId);
+
+        if (deleted) {
+          res.json({ message: "Favorite removed" });
+        } else {
+          res.status(404).json({ message: "Favorite not found" });
+        }
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   // Reviews routes
   app.get("/api/reviews/property/:propertyId", async (req, res) => {
@@ -704,30 +860,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(reviews);
     } catch (error) {
       res.status(500).json({ message: "Server error" });
-    }
-  });
-
-  // Ratings endpoint (simplified review for star ratings)
-  app.post("/api/ratings", authenticateToken, async (req: any, res: any) => {
-    try {
-      const { propertyId, rating } = req.body;
-      
-      if (!propertyId || !rating || rating < 1 || rating > 5) {
-        return res.status(400).json({ message: "Invalid rating data" });
-      }
-
-      const reviewData = {
-        propertyId: parseInt(propertyId),
-        userId: req.user.id,
-        rating: parseInt(rating),
-        comment: null
-      };
-
-      const review = await storage.createReview(reviewData);
-      res.status(201).json({ rating: review.rating, propertyId: review.propertyId });
-    } catch (error) {
-      console.error("Rating creation error:", error);
-      res.status(400).json({ message: "Failed to submit rating" });
     }
   });
 
@@ -749,13 +881,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.put("/api/users/:id", authenticateToken, async (req: any, res: any) => {
     try {
       const userId = parseInt(req.params.id);
-      
+
       if (req.user.id !== userId) {
         return res.status(403).json({ message: "Access denied" });
       }
 
       const updatedUser = await storage.updateUser(userId, req.body);
-      
+
       if (!updatedUser) {
         return res.status(404).json({ message: "User not found" });
       }
@@ -767,128 +899,142 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Favorites routes
-  app.get("/api/favorites/:userId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const userId = parseInt(req.params.userId);
-      
-      if (req.user.id !== userId) {
-        return res.status(403).json({ message: "Access denied" });
+  app.get(
+    "/api/favorites/:userId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const userId = parseInt(req.params.userId);
+
+        if (req.user.id !== userId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const favorites = await storage.getFavoritesByUser(userId);
+        res.json(favorites);
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
-
-      const favorites = await storage.getFavoritesByUser(userId);
-      res.json(favorites);
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
-  app.post("/api/favorites", authenticateToken, async (req: any, res: any) => {
-    try {
-      const favoriteData = insertFavoriteSchema.parse({
-        ...req.body,
-        userId: req.user.id
-      });
-      
-      const favorite = await storage.createFavorite(favoriteData);
-      res.json(favorite);
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
-    }
-  });
+  app.delete(
+    "/api/favorites/:userId/:propertyId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const userId = parseInt(req.params.userId);
+        const propertyId = parseInt(req.params.propertyId);
 
-  app.delete("/api/favorites/:userId/:propertyId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const userId = parseInt(req.params.userId);
-      const propertyId = parseInt(req.params.propertyId);
-      
-      if (req.user.id !== userId) {
-        return res.status(403).json({ message: "Access denied" });
+        if (req.user.id !== userId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const deleted = await storage.deleteFavorite(userId, propertyId);
+        if (deleted) {
+          res.json({ message: "Favorite removed successfully" });
+        } else {
+          res.status(404).json({ message: "Favorite not found" });
+        }
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
-
-      const deleted = await storage.deleteFavorite(userId, propertyId);
-      if (deleted) {
-        res.json({ message: "Favorite removed successfully" });
-      } else {
-        res.status(404).json({ message: "Favorite not found" });
-      }
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
 
   // Rent payment tracking routes (simple confirmation system)
-  app.get("/api/rent-payments/user/:userId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const userId = parseInt(req.params.userId);
-      const payments = await storage.getRentPaymentsByUser(userId);
-      res.json(payments);
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
-    }
-  });
-
-  app.get("/api/rent-payments/owner/:ownerId", authenticateToken, async (req: any, res: any) => {
-    try {
-      const ownerId = parseInt(req.params.ownerId);
-      const payments = await storage.getRentPaymentsByOwner(ownerId);
-      res.json(payments);
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
-    }
-  });
-
-  app.post("/api/rent-payments", authenticateToken, async (req: any, res: any) => {
-    try {
-      const { bookingId, amount, paymentMonth, paymentMethod, notes } = req.body;
-      
-      // Get booking details to get property and owner info
-      const booking = await storage.getBooking(bookingId);
-      if (!booking) {
-        return res.status(404).json({ message: "Booking not found" });
+  app.get(
+    "/api/rent-payments/user/:userId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const userId = parseInt(req.params.userId);
+        const payments = await storage.getRentPaymentsByUser(userId);
+        res.json(payments);
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
-
-      const property = await storage.getProperty(booking.propertyId);
-      if (!property) {
-        return res.status(404).json({ message: "Property not found" });
-      }
-
-      const payment = await storage.createRentPayment({
-        userId: booking.userId,
-        propertyId: booking.propertyId,
-        bookingId,
-        amount,
-        paymentMonth,
-        paymentDate: new Date(),
-        paymentMethod: paymentMethod || null,
-        notes: notes || null,
-        status: 'pending' // pending, confirmed_by_user, confirmed_by_owner, completed
-      });
-
-      res.json(payment);
-    } catch (error) {
-      res.status(400).json({ message: "Invalid input", error });
     }
-  });
+  );
 
-  app.patch("/api/rent-payments/:id/status", authenticateToken, async (req: any, res: any) => {
-    try {
-      const paymentId = parseInt(req.params.id);
-      const { status } = req.body;
-      
-      if (!['confirmed_by_user', 'confirmed_by_owner', 'completed'].includes(status)) {
-        return res.status(400).json({ message: "Invalid status" });
+  app.get(
+    "/api/rent-payments/owner/:ownerId",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const ownerId = parseInt(req.params.ownerId);
+        const payments = await storage.getRentPaymentsByOwner(ownerId);
+        res.json(payments);
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
       }
+    }
+  );
 
-      const payment = await storage.updateRentPaymentStatus(paymentId, status);
-      if (payment) {
+  app.post(
+    "/api/rent-payments",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const { bookingId, amount, paymentMonth, paymentMethod, notes } =
+          req.body;
+
+        const booking = await storage.getBooking(bookingId);
+        if (!booking) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+
+        const property = await storage.getProperty(booking.propertyId);
+        if (!property) {
+          return res.status(404).json({ message: "Property not found" });
+        }
+
+        const payment = await storage.createRentPayment({
+          userId: booking.userId,
+          propertyId: booking.propertyId,
+          bookingId,
+          amount,
+          paymentMonth,
+          paymentDate: new Date(),
+          paymentMethod: paymentMethod || null,
+          notes: notes || null,
+          status: "pending",
+        });
+
         res.json(payment);
-      } else {
-        res.status(404).json({ message: "Payment not found" });
+      } catch (error) {
+        res.status(400).json({ message: "Invalid input", error });
       }
-    } catch (error) {
-      res.status(500).json({ message: "Server error" });
     }
-  });
+  );
+
+  app.patch(
+    "/api/rent-payments/:id/status",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const paymentId = parseInt(req.params.id);
+        const { status } = req.body;
+
+        if (
+          !["confirmed_by_user", "confirmed_by_owner", "completed"].includes(
+            status
+          )
+        ) {
+          return res.status(400).json({ message: "Invalid status" });
+        }
+
+        const payment = await storage.updateRentPaymentStatus(paymentId, status);
+        if (payment) {
+          res.json(payment);
+        } else {
+          res.status(404).json({ message: "Payment not found" });
+        }
+      } catch (error) {
+        res.status(500).json({ message: "Server error" });
+      }
+    }
+  );
 
   const httpServer = createServer(app);
   return httpServer;

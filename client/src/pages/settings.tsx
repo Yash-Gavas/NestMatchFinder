@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,9 +9,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { 
-  User, Settings, Moon, Sun, Monitor, Bell, Shield, 
-  LogOut, Edit, Camera, Trash2, ArrowLeft 
+import {
+  User, Settings, Moon, Sun, Monitor, Bell, Shield,
+  LogOut, Edit, Camera, Trash2, ArrowLeft
 } from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
 import { useLocation } from "wouter";
@@ -25,8 +25,13 @@ export default function SettingsPage() {
   const { toast } = useToast();
   const { user } = useAuth();
   const queryClient = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [emailNotifications, setEmailNotifications] = useState(true);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [activeUser, setActiveUser] = useState<any>(null);
+
   const [profileData, setProfileData] = useState({
     firstName: "",
     lastName: "",
@@ -36,49 +41,133 @@ export default function SettingsPage() {
     age: "",
     gender: "",
     occupation: "",
+    profession: "",
+    company: "",
+    bio: "",
+    avatar: "",
     preferences: {}
   });
 
+  // 1. Auth Guard: block access if not logged in
   useEffect(() => {
-    if (user) {
+    const token = localStorage.getItem("authToken");
+    const storedUserRaw = localStorage.getItem("user");
+    let parsedStoredUser = null;
+
+    try {
+      parsedStoredUser = storedUserRaw ? JSON.parse(storedUserRaw) : null;
+    } catch {
+      parsedStoredUser = null;
+    }
+
+    const resolvedUser = user || parsedStoredUser;
+
+    if (!token && !resolvedUser) {
+      toast({
+        title: "Authentication Required",
+        description: "Please sign in to access your settings.",
+        variant: "destructive",
+      });
+      setLocation("/login");
+      return;
+    }
+
+    setActiveUser(resolvedUser);
+    setIsCheckingAuth(false);
+  }, [user, setLocation, toast]);
+
+  // 2. Populate form fields once authenticated user is resolved
+  useEffect(() => {
+    if (activeUser) {
       setProfileData({
-        firstName: user.firstName || "",
-        lastName: user.lastName || "",
-        name: user.name || `${user.firstName} ${user.lastName}`,
-        email: user.email || "",
-        phone: user.phone || "",
-        age: user.age?.toString() || "",
-        gender: user.gender || "",
-        occupation: user.occupation || "",
-        preferences: user.preferences || {}
+        firstName: activeUser.firstName || "",
+        lastName: activeUser.lastName || "",
+        name: activeUser.name || `${activeUser.firstName || ""} ${activeUser.lastName || ""}`.trim(),
+        email: activeUser.email || "",
+        phone: activeUser.phone || "",
+        age: activeUser.age?.toString() || "",
+        gender: activeUser.gender || "",
+        occupation: activeUser.occupation || "",
+        profession: activeUser.profession || "",
+        company: activeUser.company || "",
+        bio: activeUser.bio || "",
+        avatar: activeUser.avatar || activeUser.profilePhoto || "",
+        preferences: activeUser.preferences || {}
       });
     }
-  }, [user]);
+  }, [activeUser]);
+
+  // 3. Profile Photo Picker & Preview Handler
+  const handlePhotoClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handlePhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast({
+        title: "Invalid File",
+        description: "Please select an image file (JPG, PNG, or WebP).",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (file.size > 2 * 1024 * 1024) {
+      toast({
+        title: "File Too Large",
+        description: "Please upload an image smaller than 2 MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64Image = reader.result as string;
+      setProfileData((prev) => ({
+        ...prev,
+        avatar: base64Image,
+      }));
+      toast({
+        title: "Photo Selected",
+        description: "Click 'Update Profile' to save your new profile photo.",
+      });
+    };
+    reader.readAsDataURL(file);
+  };
 
   const handleLogout = () => {
-    // Clear any stored authentication data
-    localStorage.removeItem('userPreferences');
-    localStorage.removeItem('authToken');
-    
+    localStorage.removeItem("userPreferences");
+    localStorage.removeItem("authToken");
+    localStorage.removeItem("userType");
+    localStorage.removeItem("userEmail");
+    localStorage.removeItem("user");
+
     toast({
       title: "Logged Out",
       description: "You have been successfully logged out.",
     });
-    
-    // Navigate to home page
-    setLocation('/');
+
+    setLocation("/login");
   };
 
   const updateProfileMutation = useMutation({
     mutationFn: async (updatedData: any) => {
-      const response = await apiRequest("PUT", `/api/users/${user?.id}`, updatedData);
+      const response = await apiRequest("PUT", `/api/users/${activeUser?.id}`, updatedData);
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['/api/auth/login'] });
+    onSuccess: (savedUser) => {
+      const mergedUser = { ...activeUser, ...profileData, ...(savedUser || {}) };
+      setActiveUser(mergedUser);
+      localStorage.setItem("user", JSON.stringify(mergedUser));
+      queryClient.invalidateQueries({ queryKey: ["/api/auth/login"] });
+
       toast({
         title: "Profile Updated",
-        description: "Your profile has been saved permanently.",
+        description: "Your profile and photo have been saved.",
       });
     },
     onError: () => {
@@ -91,26 +180,52 @@ export default function SettingsPage() {
   });
 
   const handleProfileUpdate = () => {
-    if (!user) return;
-    
+    if (!activeUser?.id) {
+      toast({
+        title: "Session Expired",
+        description: "Please sign in again to update your profile.",
+        variant: "destructive",
+      });
+      setLocation("/login");
+      return;
+    }
+
     const updatedData = {
       ...profileData,
+      name: `${profileData.firstName} ${profileData.lastName}`.trim(),
       age: profileData.age ? parseInt(profileData.age) : null,
+      profilePhoto: profileData.avatar,
     };
-    
+
     updateProfileMutation.mutate(updatedData);
   };
 
   const handleDeleteAccount = () => {
     if (confirm("Are you sure you want to delete your account? This action cannot be undone.")) {
+      localStorage.removeItem("userPreferences");
+      localStorage.removeItem("authToken");
+      localStorage.removeItem("userType");
+      localStorage.removeItem("userEmail");
+      localStorage.removeItem("user");
+
       toast({
         title: "Account Deleted",
         description: "Your account has been permanently deleted.",
         variant: "destructive",
       });
-      setLocation('/');
+      setLocation("/");
     }
   };
+
+  // Prevent rendering settings UI while redirecting unauthenticated users
+  if (isCheckingAuth || !activeUser) {
+    return null;
+  }
+
+  const dashboardRoute =
+    (activeUser.userType || localStorage.getItem("userType")) === "owner"
+      ? "/dashboard/owner"
+      : "/dashboard/user";
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
@@ -120,7 +235,7 @@ export default function SettingsPage() {
           <div className="flex items-center justify-between">
             <Button
               variant="ghost"
-              onClick={() => setLocation('/dashboard/user')}
+              onClick={() => setLocation(dashboardRoute)}
               className="flex items-center"
             >
               <ArrowLeft className="w-4 h-4 mr-2" />
@@ -164,16 +279,49 @@ export default function SettingsPage() {
               <CardContent className="space-y-4">
                 <div className="flex items-center space-x-4 mb-6">
                   <div className="relative">
-                    <div className="w-20 h-20 bg-gray-200 dark:bg-gray-700 rounded-full flex items-center justify-center">
-                      <User className="w-8 h-8 text-gray-400" />
+                    <div className="w-20 h-20 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden flex items-center justify-center border">
+                      {profileData.avatar ? (
+                        <img
+                          src={profileData.avatar}
+                          alt="Profile"
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <User className="w-8 h-8 text-gray-400" />
+                      )}
                     </div>
-                    <Button size="sm" className="absolute -bottom-2 -right-2 rounded-full w-8 h-8 p-0">
+
+                    {/* Hidden file input triggered by Camera button */}
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={handlePhotoChange}
+                      className="hidden"
+                    />
+
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handlePhotoClick}
+                      title="Upload profile photo"
+                      className="absolute -bottom-2 -right-2 rounded-full w-8 h-8 p-0"
+                    >
                       <Camera className="w-4 h-4" />
                     </Button>
                   </div>
                   <div>
-                    <h3 className="font-semibold">{profileData.firstName} {profileData.lastName}</h3>
-                    <p className="text-sm text-gray-500">{profileData.profession}</p>
+                    <h3 className="font-semibold">
+                      {profileData.firstName} {profileData.lastName}
+                    </h3>
+                    <p className="text-sm text-gray-500">{profileData.profession || profileData.email}</p>
+                    <button
+                      type="button"
+                      onClick={handlePhotoClick}
+                      className="text-xs text-primary hover:underline mt-1"
+                    >
+                      Change profile photo
+                    </button>
                   </div>
                 </div>
 
@@ -183,7 +331,7 @@ export default function SettingsPage() {
                     <Input
                       id="firstName"
                       value={profileData.firstName}
-                      onChange={(e) => setProfileData(prev => ({...prev, firstName: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, firstName: e.target.value }))}
                     />
                   </div>
                   <div>
@@ -191,7 +339,7 @@ export default function SettingsPage() {
                     <Input
                       id="lastName"
                       value={profileData.lastName}
-                      onChange={(e) => setProfileData(prev => ({...prev, lastName: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, lastName: e.target.value }))}
                     />
                   </div>
                   <div>
@@ -200,7 +348,7 @@ export default function SettingsPage() {
                       id="email"
                       type="email"
                       value={profileData.email}
-                      onChange={(e) => setProfileData(prev => ({...prev, email: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, email: e.target.value }))}
                     />
                   </div>
                   <div>
@@ -208,7 +356,7 @@ export default function SettingsPage() {
                     <Input
                       id="phone"
                       value={profileData.phone}
-                      onChange={(e) => setProfileData(prev => ({...prev, phone: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, phone: e.target.value }))}
                     />
                   </div>
                   <div>
@@ -216,7 +364,7 @@ export default function SettingsPage() {
                     <Input
                       id="profession"
                       value={profileData.profession}
-                      onChange={(e) => setProfileData(prev => ({...prev, profession: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, profession: e.target.value }))}
                     />
                   </div>
                   <div>
@@ -224,7 +372,7 @@ export default function SettingsPage() {
                     <Input
                       id="company"
                       value={profileData.company}
-                      onChange={(e) => setProfileData(prev => ({...prev, company: e.target.value}))}
+                      onChange={(e) => setProfileData((prev) => ({ ...prev, company: e.target.value }))}
                     />
                   </div>
                 </div>
@@ -234,15 +382,15 @@ export default function SettingsPage() {
                   <Textarea
                     id="bio"
                     value={profileData.bio}
-                    onChange={(e) => setProfileData(prev => ({...prev, bio: e.target.value}))}
+                    onChange={(e) => setProfileData((prev) => ({ ...prev, bio: e.target.value }))}
                     placeholder="Tell us about yourself..."
                     rows={3}
                   />
                 </div>
 
-                <Button onClick={handleProfileUpdate}>
+                <Button onClick={handleProfileUpdate} disabled={updateProfileMutation.isPending}>
                   <Edit className="w-4 h-4 mr-2" />
-                  Update Profile
+                  {updateProfileMutation.isPending ? "Updating..." : "Update Profile"}
                 </Button>
               </CardContent>
             </Card>
@@ -286,9 +434,9 @@ export default function SettingsPage() {
                 </div>
 
                 <div>
-                  <Button 
+                  <Button
                     variant="outline"
-                    onClick={() => setLocation('/compatibility-quiz')}
+                    onClick={() => setLocation("/compatibility-quiz")}
                   >
                     Update Roommate Preferences
                   </Button>
@@ -349,12 +497,14 @@ export default function SettingsPage() {
                 <CardTitle>Account Security</CardTitle>
               </CardHeader>
               <CardContent className="space-y-6">
-                <div>
-                  <Button variant="outline">
-                    Change Password
-                  </Button>
-                  <p className="text-sm text-gray-500 mt-2">
-                    Update your password to keep your account secure
+                <div className="rounded-lg border p-4 bg-gray-50 dark:bg-gray-800/50">
+                  <h4 className="font-medium">OTP Login Active</h4>
+                  <p className="text-sm text-gray-500 mt-1">
+                    Your account uses one-time verification codes sent to{" "}
+                    <span className="font-medium text-gray-900 dark:text-gray-100">
+                      {profileData.email || "your registered email"}
+                    </span>
+                    . No password is needed.
                   </p>
                 </div>
 

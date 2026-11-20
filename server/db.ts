@@ -10,12 +10,14 @@ const databaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:password@
 
 console.log('Connecting to database:', databaseUrl.replace(/:[^:@]*@/, ':***@')); // Hide password in logs
 
-export const pool = new Pool({ 
+export const pool = new Pool({
   connectionString: databaseUrl,
-  ssl: databaseUrl.includes('localhost') ? false : { rejectUnauthorized: false },
+  ssl: databaseUrl.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false },
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 15000,
 });
 
 export const db = drizzle(pool, { schema });
@@ -23,11 +25,10 @@ export const db = drizzle(pool, { schema });
 // Auto-initialize database on startup
 export async function initializeDatabase() {
   try {
-     // Create SonarQube database if it doesn't exist
+    // Create SonarQube database if it doesn't exist
     await pool.query(`CREATE DATABASE sonarqube`).catch(() => {
       // Database might already exist, ignore error
     });
-    
 
     // Create all tables using raw SQL to ensure they exist
     await pool.query(`
@@ -35,7 +36,7 @@ export async function initializeDatabase() {
         id SERIAL PRIMARY KEY,
         name VARCHAR(255),
         email VARCHAR(255) UNIQUE NOT NULL,
-        password VARCHAR(255) NOT NULL,
+        password VARCHAR(255),
         "firstName" VARCHAR(255) NOT NULL,
         "lastName" VARCHAR(255) NOT NULL,
         phone VARCHAR(255) NOT NULL,
@@ -47,6 +48,8 @@ export async function initializeDatabase() {
         preferences JSONB DEFAULT '{}',
         "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+
+      ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
 
       CREATE TABLE IF NOT EXISTS properties (
         id SERIAL PRIMARY KEY,
