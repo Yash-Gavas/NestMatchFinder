@@ -5,7 +5,7 @@ import {
   type Booking, type InsertBooking, type Review, type InsertReview,
   type Favorite, type InsertFavorite, type VerificationDocument, type InsertVerificationDocument,
   type RentPayment, type InsertRentPayment
-} from "@shared/schema";
+} from "@shared/schema.js";
 
 export interface IStorage {
   // User methods
