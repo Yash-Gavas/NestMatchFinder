@@ -8,11 +8,11 @@ import {
   insertPropertySchema,
   insertReviewSchema,
   insertFavoriteSchema,
-} from "@shared/schema";
+} from "../shared/schema.js";
 import jwt from "jsonwebtoken";
-import { generateOtpCode, sendOtpEmail } from "./email";
-import { normalizeCity, isValidCoord } from "@shared/cities";
-import { getRoomTypes, parseRoomTypes, aggregateRoomTypes, sharingLabel } from "@shared/roomtypes";
+import { generateOtpCode, sendOtpEmail } from "./email.js";
+import { normalizeCity, isValidCoord } from "../shared/cities.js";
+import { getRoomTypes, parseRoomTypes, aggregateRoomTypes, sharingLabel } from "../shared/roomtypes.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "nestmatch_secret_key";
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -148,7 +148,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
 
       try {
-        const { pool } = await import("./db");
+        const { pool } = await import("./db.js");
         await pool.query(
           `CREATE TABLE IF NOT EXISTS otps (
             id SERIAL PRIMARY KEY,
@@ -261,7 +261,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
 
       try {
-        const { pool } = await import("./db");
+        const { pool } = await import("./db.js");
         await pool.query(
           `CREATE TABLE IF NOT EXISTS otps (
             id SERIAL PRIMARY KEY,
@@ -313,7 +313,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (!stored) {
         try {
-          const { pool } = await import("./db");
+          const { pool } = await import("./db.js");
           const r = await pool.query(
             `SELECT code, "expiresAt" FROM otps WHERE email = $1 ORDER BY "createdAt" DESC LIMIT 1`,
             [normalized]
@@ -350,7 +350,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const signupPayload = stored.signupPayload;
       otpStore.delete(normalized);
       try {
-        const { pool } = await import("./db");
+        const { pool } = await import("./db.js");
         await pool.query(`DELETE FROM otps WHERE email = $1`, [normalized]);
       } catch {
         // ignore
@@ -381,7 +381,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         } as any);
       } else if (!user.isVerified) {
         try {
-          const { pool } = await import("./db");
+          const { pool } = await import("./db.js");
           await pool.query(
             `UPDATE users SET "isVerified" = true WHERE id = $1`,
             [user.id]
@@ -999,7 +999,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         // Keep payment history consistent: remove payments tied to this booking
         try {
-          const { pool } = await import("./db");
+          const { pool } = await import("./db.js");
           await pool.query(`DELETE FROM rent_payments WHERE "bookingId" = $1`, [bookingId]);
         } catch {
           // ignore
