@@ -3,9 +3,9 @@ dotenv.config();
 
 import client from "prom-client";
 import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
-import { setupVite, serveStatic, log } from "./vite";
-import { initializeDatabase } from "./db";
+import { registerRoutes } from "./routes.js";
+import { setupVite, serveStatic, log } from "./vite.js";
+import { initializeDatabase } from "./db.js";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -14,7 +14,6 @@ app.use(express.urlencoded({ extended: false, limit: "50mb" }));
 const register = new client.Registry();
 client.collectDefaultMetrics({ register });
 
-// Metrics endpoint
 app.get("/metrics", async (_req: Request, res: Response) => {
   try {
     res.set("Content-Type", register.contentType);
@@ -26,7 +25,6 @@ app.get("/metrics", async (_req: Request, res: Response) => {
   }
 });
 
-// API request logger
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   const path = req.path;
@@ -57,36 +55,54 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-(async () => {
-  await initializeDatabase();
+let initPromise: Promise<void> | null = null;
 
-  const server = await registerRoutes(app);
+async function ensureInitialized() {
+  if (!initPromise) {
+    initPromise = (async () => {
+      await initializeDatabase();
 
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+      const server = await registerRoutes(app);
 
-    console.error("Unhandled route error:", err);
+      app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+        const status = err.status || err.statusCode || 500;
+        const message = err.message || "Internal Server Error";
 
-    if (!res.headersSent) {
-      res.status(status).json({ message });
-    }
-  });
+        console.error("Unhandled route error:", err);
 
-  // Unknown API paths must 404 as JSON (not fall through to index.html)
-  app.use("/api", (req: Request, res: Response) => {
-    res.status(404).json({ message: `API route not found: ${req.method} ${req.originalUrl}` });
-  });
+        if (!res.headersSent) {
+          res.status(status).json({ message });
+        }
+      });
 
-  if (process.env.NODE_ENV === "development" || app.get("env") === "development") {
-    await setupVite(app, server);
-  } else {
-    serveStatic(app);
+      app.use("/api", (req: Request, res: Response) => {
+        res.status(404).json({ message: `API route not found: ${req.method} ${req.originalUrl}` });
+      });
+
+      if (!process.env.VERCEL) {
+        if (process.env.NODE_ENV === "development" || app.get("env") === "development") {
+          await setupVite(app, server);
+        } else {
+          serveStatic(app);
+        }
+
+        const port = Number(process.env.PORT) || 5000;
+        const host = process.env.HOST || "127.0.0.1";
+        server.listen(port, host, () => {
+          log(`serving on http://${host}:${port}`);
+        });
+      }
+    })();
   }
 
-  const port = Number(process.env.PORT) || 5000;
-  const host = process.env.HOST || "127.0.0.1";
-  server.listen(port, host, () => {
-    log(`serving on http://${host}:${port}`);
-  });
-})();
+  return initPromise;
+}
+
+if (!process.env.VERCEL) {
+  void ensureInitialized();
+}
+
+export default async function handler(req: Request, res: Response) {
+  await ensureInitialized();
+  return app(req, res);
+}
