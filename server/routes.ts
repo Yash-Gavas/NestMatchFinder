@@ -12,6 +12,7 @@ import {
 import jwt from "jsonwebtoken";
 import { generateOtpCode, sendOtpEmail } from "./email";
 import { normalizeCity, isValidCoord } from "@shared/cities";
+import { storage } from "./storage.js";
 import { getRoomTypes, parseRoomTypes, aggregateRoomTypes, sharingLabel } from "@shared/roomtypes";
 
 const JWT_SECRET = process.env.JWT_SECRET || "nestmatch_secret_key";
