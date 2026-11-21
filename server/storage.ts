@@ -5,7 +5,7 @@ import {
   type Booking, type InsertBooking, type Review, type InsertReview,
   type Favorite, type InsertFavorite, type VerificationDocument, type InsertVerificationDocument,
   type RentPayment, type InsertRentPayment
-} from "@shared/schema.js";
+} from "../shared/schema.js";
 
 export interface IStorage {
   // User methods
@@ -341,7 +341,7 @@ export class MemStorage implements IStorage {
   }
 }
 
-import { DatabaseStorage } from "./db-storage";
+import { DatabaseStorage } from "./db-storage.js";
 
 // Use database storage for permanent data persistence
 export const storage = new DatabaseStorage();

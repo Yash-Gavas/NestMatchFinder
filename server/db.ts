@@ -3,7 +3,7 @@ dotenv.config();
 
 import { Pool } from 'pg';
 import { drizzle } from 'drizzle-orm/node-postgres';
-import * as schema from "@shared/schema";
+import * as schema from "../shared/schema.js";
 
 // Database configuration for local PostgreSQL
 const databaseUrl = process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/nestmatch_db';

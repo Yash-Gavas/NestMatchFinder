@@ -1,9 +1,9 @@
 // @ts-nocheck
-import { db } from "./db";
-import { users, properties, bookings, reviews, favorites, verificationDocuments, rentPayments } from "@shared/schema";
+import { db } from "./db.js";
+import { users, properties, bookings, reviews, favorites, verificationDocuments, rentPayments } from "../shared/schema.js";
 import { eq, and, inArray } from "drizzle-orm";
-import type { IStorage } from "./storage";
-import type { User, InsertUser, Property, InsertProperty, Booking, InsertBooking, Review, InsertReview, Favorite, InsertFavorite, VerificationDocument, InsertVerificationDocument, RentPayment, InsertRentPayment } from "@shared/schema";
+import type { IStorage } from "./storage.js";
+import type { User, InsertUser, Property, InsertProperty, Booking, InsertBooking, Review, InsertReview, Favorite, InsertFavorite, VerificationDocument, InsertVerificationDocument, RentPayment, InsertRentPayment } from "../shared/schema.js";
 
 export class DatabaseStorage implements IStorage {
   // User methods

@@ -2,10 +2,8 @@
 import express, { type Express } from "express";
 import fs from "fs";
 import path from "path";
-import { createServer as createViteServer, createLogger } from "vite";
 import { type Server } from "http";
-import viteConfig from "../vite.config.js";
-import { nanoid } from "nanoid";
+import { randomUUID } from "crypto";
 
 import { fileURLToPath } from "url";
 
@@ -13,8 +11,6 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-
-const viteLogger = createLogger();
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -28,6 +24,14 @@ export function log(message: string, source = "express") {
 }
 
 export async function setupVite(app: Express, server: Server) {
+  // Dev-only: load vite and its config lazily so production/serverless
+  // never needs to resolve them at import time.
+  // Specifiers kept in variables so Vercel's file tracer doesn't bundle vite.
+  const viteModule = "vite";
+  const viteConfigModule = "../vite.config.js";
+  const { createServer: createViteServer, createLogger } = await import(viteModule);
+  const { default: viteConfig } = await import(viteConfigModule);
+  const viteLogger = createLogger();
   const serverOptions = {
     middlewareMode: true,
     hmr: { server },
@@ -64,7 +68,7 @@ export async function setupVite(app: Express, server: Server) {
       let template = await fs.promises.readFile(clientTemplate, "utf-8");
       template = template.replace(
         `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`,
+        `src="/src/main.tsx?v=${randomUUID()}"`,
       );
       const page = await vite.transformIndexHtml(url, template);
       res.status(200).set({ "Content-Type": "text/html" }).end(page);
