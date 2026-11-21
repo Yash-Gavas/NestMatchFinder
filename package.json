@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "cross-env NODE_ENV=development tsx server/index.ts",
     "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
@@ -53,12 +56,10 @@
     "@stripe/stripe-js": "^7.3.1",
     "@tanstack/react-query": "^5.60.5",
     "@types/bcrypt": "^5.0.2",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/jsonwebtoken": "^9.0.9",
     "@types/memoizee": "^0.4.12",
     "@types/pg": "^8.15.2",
     "bcrypt": "^6.0.0",
-    "better-sqlite3": "^11.10.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
