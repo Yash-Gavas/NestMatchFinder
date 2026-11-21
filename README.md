@@ -2,6 +2,10 @@
 
 A comprehensive PG (Paying Guest) finder platform built with React, Node.js, and PostgreSQL. Features property listings, booking management, roommate compatibility matching, and integrated payment tracking.
 
+## Live Demo
+
+**[nestmatch.yash-gavas.in](https://nestmatch.yash-gavas.in/)**
+
 ## Features
 
 - **Dual User System**: Separate interfaces for property owners and tenants
@@ -12,7 +16,7 @@ A comprehensive PG (Paying Guest) finder platform built with React, Node.js, and
 - **Interactive Maps**: View properties with location markers
 - **Roommate Compatibility**: Algorithm-based matching system
 - **Payment Tracking**: Simple rent payment confirmation system
-- **Authentication**: Secure user login and session management
+- **Authentication**: Email OTP login/signup (via Resend) with JWT-based sessions
 
 ## Prerequisites
 
@@ -47,10 +51,12 @@ If you prefer manual setup:
    - **Railway** (free): https://railway.app/
    - Local PostgreSQL if you have it installed
 
-2. **Edit .env file**:
+2. **Edit .env file** (see `.env.example`):
 ```
 DATABASE_URL=your-database-url-here
-SESSION_SECRET=any-random-secret-key
+JWT_SECRET=any-long-random-string
+RESEND_API_KEY=your-resend-api-key
+RESEND_FROM_EMAIL=NestMatch <onboarding@resend.dev>
 ```
 
 3. **Run commands**:
@@ -114,9 +120,9 @@ nestmatch-pg-finder/
 
 - `npm run dev` - Start development server (frontend + backend)
 - `npm run build` - Build for production
-- `npm run preview` - Preview production build
 - `npm run db:push` - Push database schema changes
-- `npm run db:generate` - Generate migration files
+- `npm run check` - Type-check the project
+- `npm test` - Run tests
 
 ## Default Test Accounts
 
@@ -156,7 +162,8 @@ After setting up the database, you can create test accounts:
 - **Database**: PostgreSQL with Drizzle ORM
 - **UI Components**: Radix UI, Lucide React Icons
 - **State Management**: TanStack Query
-- **Authentication**: Session-based auth
+- **Authentication**: Email OTP (Resend) + JWT
+- **Hosting**: Vercel (frontend + serverless API), Neon PostgreSQL
 - **Maps**: Leaflet integration
 
 ## Troubleshooting
@@ -190,13 +197,47 @@ npm run db:push
 
 ## Production Deployment
 
-For production deployment:
+The production site runs at **[nestmatch.yash-gavas.in](https://nestmatch.yash-gavas.in/)** on Vercel with a Neon PostgreSQL database.
 
-1. Set `NODE_ENV=production` in environment
-2. Update DATABASE_URL to production database
-3. Set a secure SESSION_SECRET
-4. Build the project: `npm run build`
-5. Deploy to services like Railway, Render, or Vercel
+### Deploy on Vercel
+
+1. Push the repo to GitHub and import it in [Vercel](https://vercel.com).
+2. Add these environment variables under **Settings → Environment Variables**:
+
+| Name | Value |
+|------|-------|
+| `DATABASE_URL` | Neon connection string |
+| `JWT_SECRET` | Long random string |
+| `RESEND_API_KEY` | Your Resend API key |
+| `RESEND_FROM_EMAIL` | e.g. `NestMatch <noreply@yash-gavas.in>` |
+| `NODE_ENV` | `production` |
+
+3. Deploy. `vercel.json` serves the built client from `dist/public` and routes `/api/*` to `server/index.ts`.
+
+### Custom domain (GoDaddy)
+
+1. In Vercel: **Settings → Domains → Add Domain** → `nestmatch.yash-gavas.in`.
+2. In GoDaddy DNS, add a **CNAME** record: Name `nestmatch`, Value = the target shown on the Vercel domain card.
+3. Click **Refresh** in Vercel; HTTPS is issued automatically once DNS propagates.
+
+### Email OTP (Resend)
+
+- `onboarding@resend.dev` only delivers to your own Resend account email (testing).
+- For real users, verify `yash-gavas.in` in Resend (add the SPF/DKIM records in GoDaddy) and set `RESEND_FROM_EMAIL` to an address on that domain.
+- Endpoints: `POST /api/auth/send-otp` and `POST /api/auth/verify-otp`. Codes expire after 10 minutes, and first-time emails may land in spam.
+
+### Node ESM note
+
+The project uses `"type": "module"`, and Vercel runs the server files as separate ES modules. Relative imports in `server/` and `shared/` must therefore use explicit `.js` extensions, and TypeScript path aliases like `@shared/*` must not be used in server code. Use `../shared/schema.js`, not `@shared/schema`. Otherwise the API crashes with `ERR_MODULE_NOT_FOUND`.
+
+### Self-hosting
+
+```bash
+npm run build
+NODE_ENV=production npm start
+```
+
+Docker and Kubernetes configs are included (`Dockerfile`, `docker-compose.yml`, `k8s/`).
 
 ## Support
 
