@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,9 +14,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Home, Users, Calendar, Plus, MapPin, Star, Settings, Upload, Camera, Navigation, FileText, CheckCircle, AlertCircle, User, Edit, Trash2, Save } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation } from "wouter";
-import { useAuth } from "@/lib/auth-simple";
+import { useAuth } from "@/lib/auth-context";
 import type { Property, Booking } from "@shared/schema";
 import LocationAutocomplete from "@/components/location-autocomplete";
+import { OwnerPaymentsTab, TenantInfo, TenantsAndBeds, tenantName } from "@/components/owner-parts";
+import { geocodeAddress } from "@/lib/geocode";
+import { RoomTypesEditor, RoomTypeList, emptyRoomType, priceLabel } from "@/components/room-types";
+import { parseRoomTypes, aggregateRoomTypes, getRoomTypes, sharingLabel } from "@shared/roomtypes";
+import { SUPPORTED_CITIES, normalizeCity, detectCity, isValidCoord } from "@shared/cities";
 
 export default function OwnerDashboard() {
   const { user } = useAuth();
@@ -25,6 +30,7 @@ export default function OwnerDashboard() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const [addedTypes, setAddedTypes] = useState<any[]>([]);
   const [newProperty, setNewProperty] = useState({
     name: "",
     address: "",
@@ -33,6 +39,7 @@ export default function OwnerDashboard() {
     pincode: "",
     rent: "",
     securityDeposit: "",
+    roomTypes: [emptyRoomType("1")] as any[],
     totalRooms: "",
     totalBeds: "",
     availableBeds: "",
@@ -170,13 +177,28 @@ export default function OwnerDashboard() {
   const totalProperties = properties.length;
   const verifiedProperties = properties.filter((p: any) => p.isVerified).length;
   const pendingBookings = bookings.filter((b: any) => b.status === "pending").length;
-  const monthlyRevenue = bookings
-    .filter((b: any) => b.status === "approved")
-    .reduce((sum: number, b: any) => sum + b.rent, 0);
+  // Revenue is built only from approved tenants (each at the rent that was booked)
+  // and from payments the owner has actually approved.
+  const approvedTenants = bookings.filter((b: any) => b.status === "approved");
+  const monthlyRevenue = approvedTenants.reduce((sum: number, b: any) => sum + Number(b.rent || 0), 0);
+  const currentMonth = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
+  const { data: ownerPayments = [] } = useQuery({
+    queryKey: [`/api/rent-payments/owner/${user?.id}`],
+    enabled: !!user?.id,
+  }) as { data: any[] };
+  const collectedThisMonth = ownerPayments
+    .filter((p: any) => p.status === "paid" && p.paymentMonth === currentMonth)
+    .reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0);
+  const awaitingApproval = ownerPayments.filter((p: any) => p.status === "submitted").length;
 
   // Booking action handlers
   const handleBookingAction = (bookingId: number, status: string) => {
     updateBookingMutation.mutate({ id: bookingId, status });
+  };
+  const handleRemoveTenant = (booking: any) => {
+    if (window.confirm(`Remove ${tenantName(booking)} from ${booking.propertyName}? Their bed becomes available again.`)) {
+      updateBookingMutation.mutate({ id: booking.id, status: "removed" });
+    }
   };
   const createPropertyMutation = useMutation({
     mutationFn: async (propertyData: any) => {
@@ -216,6 +238,8 @@ export default function OwnerDashboard() {
         description: "Booking status has been updated successfully.",
       });
       queryClient.invalidateQueries({ queryKey: [`/api/bookings/owner/${user?.id}`] });
+      queryClient.invalidateQueries({ queryKey: [`/api/properties/owner/${user?.id}`] });
+      queryClient.invalidateQueries({ queryKey: ["/api/properties"] });
     },
     onError: (error: any) => {
       toast({
@@ -232,7 +256,9 @@ export default function OwnerDashboard() {
       const response = await apiRequest("PUT", `/api/properties/${propertyData.id}`, propertyData);
       return response.json();
     },
-    onSuccess: () => {
+    onSuccess: (updated) => {
+      if (updated?.id) setSelectedProperty(updated);
+      setAddedTypes([]);
       toast({
         title: "Property Updated",
         description: "Your property has been successfully updated.",
@@ -284,6 +310,7 @@ export default function OwnerDashboard() {
       pincode: "",
       rent: "",
       securityDeposit: "",
+      roomTypes: [emptyRoomType("1")] as any[],
       totalRooms: "",
       totalBeds: "",
       availableBeds: "",
@@ -317,8 +344,54 @@ export default function OwnerDashboard() {
     setEditFormData(selectedProperty);
   };
 
-  const savePropertyChanges = () => {
-    updatePropertyMutation.mutate(editFormData);
+  useEffect(() => {
+    setAddedTypes([]);
+  }, [selectedProperty?.id]);
+
+  const savePropertyChanges = async () => {
+    const f = editFormData;
+    const existing = getRoomTypes(f);
+    if (existing.length === 0 && addedTypes.length === 0 && !(Number(f.rent) > 0)) {
+      toast({ title: "Invalid rent", description: "Rent must be greater than 0.", variant: "destructive" });
+      return;
+    }
+    const payload: any = {
+      id: f.id,
+      name: f.name,
+      city: normalizeCity(f.city),
+      address: f.address,
+      description: f.description,
+      gender: f.gender,
+    };
+    if (existing.length > 0 || addedTypes.length > 0) {
+      const merged = [...existing, ...addedTypes];
+      // existing types are validated by the server too; check new rows here for a clear message
+      if (addedTypes.length > 0) {
+        const check = parseRoomTypes(addedTypes);
+        if (check.error) {
+          toast({ title: "Room types", description: check.error, variant: "destructive" });
+          return;
+        }
+      }
+      payload.roomTypes = merged;
+    } else {
+      payload.rent = Number(f.rent);
+      payload.securityDeposit = Number(f.securityDeposit || 0);
+    }
+    // If the address changed, re-pin it on the map
+    if (f.address !== selectedProperty.address || normalizeCity(f.city) !== normalizeCity(selectedProperty.city)) {
+      const found = await geocodeAddress({ address: f.address, city: f.city, state: f.state, pincode: f.pincode });
+      if (found) {
+        payload.latitude = found.lat;
+        payload.longitude = found.lng;
+      } else {
+        toast({
+          title: "Map pin not updated",
+          description: "The new address could not be found on the map, so the old pin was kept.",
+        });
+      }
+    }
+    updatePropertyMutation.mutate(payload);
   };
 
   const deleteProperty = () => {
@@ -327,66 +400,55 @@ export default function OwnerDashboard() {
     }
   };
 
-  const handleAddProperty = () => {
-    // Validate required fields
-    if (!newProperty.name || !newProperty.city || !newProperty.address || 
-        !newProperty.rent || !newProperty.totalRooms || !newProperty.totalBeds || 
-        !newProperty.availableBeds || !newProperty.gender) {
-      toast({
-        title: "Missing Information",
-        description: "Please fill in all required fields.",
-        variant: "destructive",
-      });
-      return;
+  const handleAddProperty = async () => {
+    const np = newProperty;
+    const fail = (title: string, description: string) =>
+      toast({ title, description, variant: "destructive" });
+
+    if (!np.name || !np.city || !np.address || !np.totalRooms || !np.gender) {
+      return fail("Missing Information", "Please fill in all required fields.");
+    }
+    const parsedTypes = parseRoomTypes(np.roomTypes);
+    if (parsedTypes.error) return fail("Room types", parsedTypes.error);
+    if (!np.ownerDocuments.aadhar || !np.ownerDocuments.license) {
+      return fail("Missing Documents", "Please upload both Aadhar card and property license.");
+    }
+    if (np.images.length === 0) {
+      return fail("Missing Photos", "Please upload at least one property photo.");
     }
 
-    if (!newProperty.ownerDocuments.aadhar || !newProperty.ownerDocuments.license) {
-      toast({
-        title: "Missing Documents",
-        description: "Please upload both Aadhar card and property license.",
-        variant: "destructive",
-      });
-      return;
+    // Every PG needs a real map pin: use what the owner set, otherwise look it up
+    let latitude = np.latitude;
+    let longitude = np.longitude;
+    if (!isValidCoord(latitude, longitude)) {
+      toast({ title: "Finding location…", description: "Looking up your address on the map." });
+      const found = await geocodeAddress({ address: np.address, city: np.city, state: np.state, pincode: np.pincode });
+      if (!found) {
+        return fail(
+          "Location not found",
+          "We could not place this address on the map. Pick it from the address suggestions, use 'current location', or enter latitude/longitude in the location step.",
+        );
+      }
+      latitude = found.lat;
+      longitude = found.lng;
     }
 
-    if (newProperty.images.length === 0) {
-      toast({
-        title: "Missing Photos",
-        description: "Please upload at least one property photo.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    // Prepare property data for API
-    const propertyData = {
-      name: newProperty.name,
-      address: newProperty.address,
-      city: newProperty.city,
-      state: newProperty.state,
-      pincode: newProperty.pincode,
-      rent: parseInt(newProperty.rent),
-      securityDeposit: parseInt(newProperty.securityDeposit || "0"),
-      totalRooms: parseInt(newProperty.totalRooms),
-      totalBeds: parseInt(newProperty.totalBeds),
-      availableBeds: parseInt(newProperty.availableBeds),
-      gender: newProperty.gender,
-      description: newProperty.description,
-      amenities: newProperty.amenities,
-      latitude: newProperty.latitude || undefined,
-      longitude: newProperty.longitude || undefined,
-      images: newProperty.images,
-      ownerDocuments: {
-        aadhar: newProperty.ownerDocuments.aadhar?.name || null,
-        license: newProperty.ownerDocuments.license?.name || null
-      },
-      isVerified: false,
-    };
-
-    createPropertyMutation.mutate(propertyData);
+    createPropertyMutation.mutate({
+      name: np.name.trim(),
+      address: np.address.trim(),
+      city: normalizeCity(np.city),
+      state: np.state,
+      pincode: np.pincode,
+      roomTypes: parsedTypes.types,
+      totalRooms: parseInt(np.totalRooms),
+      gender: np.gender,
+      description: np.description,
+      amenities: np.amenities,
+      latitude,
+      longitude,
+      images: np.images,
+    });
   };
-
-
 
   const handleCancelBooking = async (bookingId: number) => {
     if (window.confirm("Are you sure you want to cancel this booking? This action cannot be undone.")) {
@@ -399,6 +461,7 @@ export default function OwnerDashboard() {
           });
           queryClient.invalidateQueries({ queryKey: [`/api/bookings/owner/${user?.id}`] });
           queryClient.invalidateQueries({ queryKey: [`/api/properties/owner/${user?.id}`] });
+          queryClient.invalidateQueries({ queryKey: ["/api/properties"] });
         }
       } catch (error) {
         toast({
@@ -476,16 +539,22 @@ export default function OwnerDashboard() {
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">₹{monthlyRevenue.toLocaleString()}</div>
+              <p className="text-xs text-muted-foreground mt-1">
+                {approvedTenants.length} tenant{approvedTenants.length === 1 ? "" : "s"} • collected this month ₹{collectedThisMonth.toLocaleString()}
+              </p>
             </CardContent>
           </Card>
         </div>
 
         {/* Tabs */}
         <Tabs value={activeTab} onValueChange={setActiveTab}>
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="properties">Properties</TabsTrigger>
             <TabsTrigger value="bookings">Bookings</TabsTrigger>
+            <TabsTrigger value="payments">
+              Payments{awaitingApproval > 0 ? ` (${awaitingApproval})` : ""}
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
@@ -500,7 +569,7 @@ export default function OwnerDashboard() {
                     {properties.slice(0, 3).map((property) => (
                       <div key={property.id} className="flex items-center space-x-4">
                         <img
-                          src={property.images[0]}
+                          src={property.images?.[0] || "https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=200&h=120&fit=crop"}
                           alt={property.name}
                           className="w-12 h-12 rounded-lg object-cover"
                         />
@@ -533,7 +602,7 @@ export default function OwnerDashboard() {
                                 <User className="w-4 h-4 text-primary" />
                               </div>
                               <div>
-                                <p className="font-medium">{booking.userName || 'Unknown User'}</p>
+                                <p className="font-medium">{tenantName(booking)}</p>
                                 <p className="text-sm text-gray-500">{booking.propertyName}</p>
                                 <p className="text-xs text-gray-400">₹{booking.rent}/month • {booking.userEmail}</p>
                               </div>
@@ -570,7 +639,7 @@ export default function OwnerDashboard() {
                 <Card key={property.id}>
                   <div className="aspect-video relative">
                     <img
-                      src={property.images[0]}
+                      src={property.images?.[0] || "https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=200&h=120&fit=crop"}
                       alt={property.name}
                       className="w-full h-full object-cover rounded-t-lg"
                     />
@@ -590,9 +659,20 @@ export default function OwnerDashboard() {
                   </CardHeader>
                   <CardContent>
                     <div className="flex justify-between items-center">
-                      <span className="text-lg font-bold">₹{property.rent}/month</span>
+                      <span className="text-lg font-bold">{priceLabel(property)}/month</span>
                       <Badge variant="outline">{property.gender}</Badge>
                     </div>
+                    {getRoomTypes(property).length > 0 ? (
+                      <RoomTypeList property={property} compact />
+                    ) : (
+                      <p className="text-xs text-gray-500 mt-1">
+                        Deposit ₹{Number(property.securityDeposit || 0).toLocaleString()}
+                      </p>
+                    )}
+                    <p className={`text-sm mt-2 ${property.availableBeds > 0 ? "text-green-600" : "text-red-600"}`}>
+                      {property.availableBeds} of {property.totalBeds} beds available •{" "}
+                      {approvedTenants.filter((b: any) => b.propertyId === property.id).length} tenant(s)
+                    </p>
                     <Button 
                       className="w-full mt-4" 
                       variant="outline"
@@ -608,77 +688,101 @@ export default function OwnerDashboard() {
 
           <TabsContent value="bookings" className="space-y-6">
             <h2 className="text-2xl font-bold">Booking Requests</h2>
-            
+
+            {bookings.length === 0 && (
+              <p className="text-gray-500">No booking requests yet.</p>
+            )}
+
             <div className="space-y-4">
-              {bookings.map((booking) => {
-                const property = properties.find(p => p.id === booking.propertyId);
-                return (
-                  <Card key={booking.id}>
-                    <CardContent className="pt-6">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-4">
-                          <img
-                            src={property?.images[0]}
-                            alt={property?.name}
-                            className="w-16 h-16 rounded-lg object-cover"
-                          />
-                          <div>
-                            <h3 className="font-semibold">{property?.name}</h3>
-                            <p className="text-sm text-gray-500">{property?.city}</p>
-                            <p className="text-sm font-medium">₹{booking.rent}/month</p>
+              {[...bookings]
+                .sort((a: any, b: any) => (a.status === "pending" ? -1 : 0) - (b.status === "pending" ? -1 : 0))
+                .map((booking: any) => {
+                  const property = properties.find((p: any) => p.id === booking.propertyId);
+                  return (
+                    <Card key={booking.id}>
+                      <CardContent className="pt-6">
+                        <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
+                          <div className="flex items-start space-x-4">
+                            <img
+                              src={property?.images?.[0] || "https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=200&h=120&fit=crop"}
+                              alt={booking.propertyName}
+                              className="w-16 h-16 rounded-lg object-cover"
+                            />
+                            <div className="space-y-2">
+                              <div>
+                                <h3 className="font-semibold">{booking.propertyName}</h3>
+                                <p className="text-sm text-gray-500">{booking.propertyCity}</p>
+                                <p className="text-sm font-medium">
+                                  {booking.sharing ? `${sharingLabel(booking.sharing)} • ` : ""}₹{Number(booking.rent).toLocaleString()}/month • Deposit ₹{Number(booking.securityDeposit || 0).toLocaleString()}
+                                </p>
+                                {booking.moveInDate && (
+                                  <p className="text-xs text-gray-500">
+                                    {new Date(booking.moveInDate).toLocaleDateString()}
+                                    {booking.moveOutDate ? ` → ${new Date(booking.moveOutDate).toLocaleDateString()}` : ""}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="border-l-2 pl-3">
+                                <TenantInfo booking={booking} />
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <Badge
+                              variant={
+                                booking.status === "pending" ? "outline" :
+                                booking.status === "approved" ? "default" : "destructive"
+                              }
+                            >
+                              {{ pending: "Needs your decision", approved: "Approved tenant", rejected: "Rejected", removed: "Removed" }[booking.status as string] || booking.status}
+                            </Badge>
+
+                            {booking.status === "pending" && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  onClick={() => handleBookingAction(booking.id, "approved")}
+                                  disabled={updateBookingMutation.isPending}
+                                >
+                                  Approve
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => handleBookingAction(booking.id, "rejected")}
+                                  disabled={updateBookingMutation.isPending}
+                                >
+                                  Reject
+                                </Button>
+                              </>
+                            )}
+
+                            {booking.status === "approved" && (
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                onClick={() => handleRemoveTenant(booking)}
+                                disabled={updateBookingMutation.isPending}
+                              >
+                                Remove tenant
+                              </Button>
+                            )}
                           </div>
                         </div>
-                        
-                        <div className="flex items-center space-x-2">
-                          <Badge 
-                            variant={
-                              booking.status === "pending" ? "outline" :
-                              booking.status === "approved" ? "default" : "destructive"
-                            }
-                          >
-                            {booking.status}
-                          </Badge>
-                          
-                          {booking.status === "pending" && (
-                            <div className="flex space-x-2">
-                              <Button 
-                                size="sm" 
-                                variant="default"
-                                onClick={() => handleBookingAction(booking.id, 'approved')}
-                                disabled={updateBookingMutation.isPending}
-                              >
-                                Approve
-                              </Button>
-                              <Button 
-                                size="sm" 
-                                variant="outline"
-                                onClick={() => handleBookingAction(booking.id, 'rejected')}
-                                disabled={updateBookingMutation.isPending}
-                              >
-                                Reject
-                              </Button>
-                            </div>
-                          )}
-                          
-                          {booking.status === "approved" && (
-                            <div className="flex space-x-2">
-                              <Button 
-                                size="sm" 
-                                variant="destructive"
-                                onClick={() => handleCancelBooking(booking.id)}
-                                disabled={updateBookingMutation.isPending}
-                              >
-                                Cancel Booking
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
+                      </CardContent>
+                    </Card>
+                  );
+                })}
             </div>
+          </TabsContent>
+
+          <TabsContent value="payments" className="space-y-6">
+            <h2 className="text-2xl font-bold">Rent Payments</h2>
+            <p className="text-sm text-gray-500">
+              Tenants mark a month as paid (cash or online). Approve it once you have received the money.
+            </p>
+            <OwnerPaymentsTab ownerId={user?.id} />
           </TabsContent>
         </Tabs>
 
@@ -788,22 +892,9 @@ export default function OwnerDashboard() {
                           <SelectValue placeholder="Select city" />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="Mumbai">Mumbai</SelectItem>
-                          <SelectItem value="Bangalore">Bangalore</SelectItem>
-                          <SelectItem value="Delhi">Delhi</SelectItem>
-                          <SelectItem value="Pune">Pune</SelectItem>
-                          <SelectItem value="Hyderabad">Hyderabad</SelectItem>
-                          <SelectItem value="Chennai">Chennai</SelectItem>
-                          <SelectItem value="Kolkata">Kolkata</SelectItem>
-                          <SelectItem value="Ahmedabad">Ahmedabad</SelectItem>
-                          <SelectItem value="Noida">Noida</SelectItem>
-                          <SelectItem value="Gurgaon">Gurgaon</SelectItem>
-                          <SelectItem value="Jaipur">Jaipur</SelectItem>
-                          <SelectItem value="Kochi">Kochi</SelectItem>
-                          <SelectItem value="Coimbatore">Coimbatore</SelectItem>
-                          <SelectItem value="Indore">Indore</SelectItem>
-                          <SelectItem value="Lucknow">Lucknow</SelectItem>
-                          <SelectItem value="Nagpur">Nagpur</SelectItem>
+                          {SUPPORTED_CITIES.map((c) => (
+                            <SelectItem key={c} value={c}>{c}</SelectItem>
+                          ))}
                         </SelectContent>
                       </Select>
                     </div>
@@ -840,7 +931,8 @@ export default function OwnerDashboard() {
                         setNewProperty((prev) => ({
                           ...prev,
                           address: s.display,
-                          city: s.city || prev.city,
+                          // only accept a city we recognise ("Koramangala" is an area, not the city)
+                          city: detectCity(s.display) || detectCity(s.city) || prev.city,
                           state: s.state || prev.state,
                           pincode: s.postcode || prev.pincode,
                           latitude: s.lat || prev.latitude,
@@ -851,7 +943,7 @@ export default function OwnerDashboard() {
                     />
                   </div>
 
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
                       <Label htmlFor="totalRooms">Total Rooms</Label>
                       <Input
@@ -860,26 +952,6 @@ export default function OwnerDashboard() {
                         value={newProperty.totalRooms}
                         onChange={(e) => setNewProperty({...newProperty, totalRooms: e.target.value})}
                         placeholder="10"
-                      />
-                    </div>
-                    <div>
-                      <Label htmlFor="totalBeds">Total Beds</Label>
-                      <Input
-                        id="totalBeds"
-                        type="number"
-                        value={newProperty.totalBeds}
-                        onChange={(e) => setNewProperty({...newProperty, totalBeds: e.target.value})}
-                        placeholder="20"
-                      />
-                    </div>
-                    <div>
-                      <Label htmlFor="availableBeds">Available Beds</Label>
-                      <Input
-                        id="availableBeds"
-                        type="number"
-                        value={newProperty.availableBeds}
-                        onChange={(e) => setNewProperty({...newProperty, availableBeds: e.target.value})}
-                        placeholder="5"
                       />
                     </div>
                     <div>
@@ -897,28 +969,10 @@ export default function OwnerDashboard() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                      <Label htmlFor="rent">Monthly Rent per Bed</Label>
-                      <Input
-                        id="rent"
-                        type="number"
-                        value={newProperty.rent}
-                        onChange={(e) => setNewProperty({...newProperty, rent: e.target.value})}
-                        placeholder="8000"
-                      />
-                    </div>
-                    <div>
-                      <Label htmlFor="securityDeposit">Security Deposit</Label>
-                      <Input
-                        id="securityDeposit"
-                        type="number"
-                        value={newProperty.securityDeposit}
-                        onChange={(e) => setNewProperty({...newProperty, securityDeposit: e.target.value})}
-                        placeholder="10000"
-                      />
-                    </div>
-                  </div>
+                  <RoomTypesEditor
+                    value={newProperty.roomTypes}
+                    onChange={(roomTypes) => setNewProperty({...newProperty, roomTypes})}
+                  />
 
                   <div>
                     <Label htmlFor="description">Property Description</Label>
@@ -1086,10 +1140,16 @@ export default function OwnerDashboard() {
                           </p>
                         </div>
                         <div className="text-right">
-                          <div className="text-2xl font-bold text-emerald-600">₹{newProperty.rent}/month</div>
-                          {newProperty.securityDeposit && (
-                            <div className="text-sm text-gray-500 dark:text-gray-400">+ ₹{newProperty.securityDeposit} deposit</div>
-                          )}
+                          {(() => {
+                            const pt = parseRoomTypes(newProperty.roomTypes);
+                            return pt.types ? (
+                              <div className="text-2xl font-bold text-emerald-600">
+                                {pt.types.length > 1 ? "From " : ""}₹{aggregateRoomTypes(pt.types).rent.toLocaleString()}/month
+                              </div>
+                            ) : (
+                              <div className="text-sm text-amber-600">Complete the room types</div>
+                            );
+                          })()}
                         </div>
                       </div>
                       
@@ -1099,11 +1159,11 @@ export default function OwnerDashboard() {
                           <div className="text-xs text-gray-500 dark:text-gray-400">Total Rooms</div>
                         </div>
                         <div className="text-center">
-                          <div className="font-semibold text-gray-900 dark:text-white">{newProperty.totalBeds}</div>
+                          <div className="font-semibold text-gray-900 dark:text-white">{parseRoomTypes(newProperty.roomTypes).types?.reduce((t, x) => t + x.totalBeds, 0) ?? "-"}</div>
                           <div className="text-xs text-gray-500 dark:text-gray-400">Total Beds</div>
                         </div>
                         <div className="text-center">
-                          <div className="font-semibold text-gray-900 dark:text-white">{newProperty.availableBeds}</div>
+                          <div className="font-semibold text-gray-900 dark:text-white">{parseRoomTypes(newProperty.roomTypes).types?.reduce((t, x) => t + x.availableBeds, 0) ?? "-"}</div>
                           <div className="text-xs text-gray-500 dark:text-gray-400">Available</div>
                         </div>
                       </div>
@@ -1204,7 +1264,7 @@ export default function OwnerDashboard() {
 
         {/* Property Management Dialog */}
         <Dialog open={manageDialogOpen} onOpenChange={setManageDialogOpen}>
-          <DialogContent className="max-w-2xl">
+          <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>Manage Property: {selectedProperty?.name}</DialogTitle>
             </DialogHeader>
@@ -1227,10 +1287,23 @@ export default function OwnerDashboard() {
                     <Label>Available Beds</Label>
                     <p className="text-sm text-gray-600 dark:text-gray-300">{selectedProperty.availableBeds}</p>
                   </div>
-                  <div>
-                    <Label>Rent</Label>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">₹{selectedProperty.rent}/month</p>
-                  </div>
+                  {getRoomTypes(selectedProperty).length > 0 ? (
+                    <div className="col-span-2">
+                      <Label>Room types</Label>
+                      <RoomTypeList property={selectedProperty} />
+                    </div>
+                  ) : (
+                    <>
+                      <div>
+                        <Label>Rent</Label>
+                        <p className="text-sm text-gray-600 dark:text-gray-300">₹{Number(selectedProperty.rent).toLocaleString()}/month</p>
+                      </div>
+                      <div>
+                        <Label>Security Deposit</Label>
+                        <p className="text-sm text-gray-600 dark:text-gray-300">₹{Number(selectedProperty.securityDeposit || 0).toLocaleString()}</p>
+                      </div>
+                    </>
+                  )}
                   <div>
                     <Label>Gender Preference</Label>
                     <p className="text-sm text-gray-600 dark:text-gray-300">{selectedProperty.gender}</p>
@@ -1246,6 +1319,15 @@ export default function OwnerDashboard() {
                   <Label>Address</Label>
                   <p className="text-sm text-gray-600 dark:text-gray-300">{selectedProperty.address}</p>
                 </div>
+
+                <TenantsAndBeds
+                  property={selectedProperty}
+                  bookings={bookings}
+                  onPropertyChange={(p) => {
+                    setSelectedProperty(p);
+                    setEditFormData(p);
+                  }}
+                />
 
                 <div className="flex gap-2 pt-4">
                   <Button 
@@ -1285,33 +1367,93 @@ export default function OwnerDashboard() {
                   </div>
                   <div>
                     <Label>City</Label>
-                    <Input
-                      value={editFormData.city || ''}
-                      onChange={(e) => setEditFormData({...editFormData, city: e.target.value})}
-                    />
+                    <Select
+                      value={normalizeCity(editFormData.city) || undefined}
+                      onValueChange={(value) => setEditFormData({...editFormData, city: value})}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select city" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[...new Set([...SUPPORTED_CITIES, normalizeCity(editFormData.city)].filter(Boolean))].map((c) => (
+                          <SelectItem key={c} value={c}>{c}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
-                  <div>
-                    <Label>Total Beds</Label>
-                    <Input
-                      type="number"
-                      value={editFormData.totalBeds || ''}
-                      onChange={(e) => setEditFormData({...editFormData, totalBeds: parseInt(e.target.value)})}
-                    />
-                  </div>
-                  <div>
-                    <Label>Available Beds</Label>
-                    <Input
-                      type="number"
-                      value={editFormData.availableBeds || ''}
-                      onChange={(e) => setEditFormData({...editFormData, availableBeds: parseInt(e.target.value)})}
-                    />
-                  </div>
-                  <div>
-                    <Label>Rent</Label>
-                    <Input
-                      type="number"
-                      value={editFormData.rent || ''}
-                      onChange={(e) => setEditFormData({...editFormData, rent: parseInt(e.target.value)})}
+                  {getRoomTypes(editFormData).length > 0 ? (
+                    <div className="col-span-2 space-y-3">
+                      <Label>Prices per room type</Label>
+                      {getRoomTypes(editFormData).map((t) => (
+                        <div key={t.sharing} className="grid grid-cols-3 gap-3 items-end border rounded-lg p-3">
+                          <div className="text-sm font-medium">{sharingLabel(t.sharing)}</div>
+                          <div>
+                            <Label className="text-xs">Rent / bed (₹)</Label>
+                            <Input
+                              type="number"
+                              min={1}
+                              value={t.rent}
+                              onChange={(e) =>
+                                setEditFormData({
+                                  ...editFormData,
+                                  roomTypes: getRoomTypes(editFormData).map((x) =>
+                                    x.sharing === t.sharing ? { ...x, rent: parseInt(e.target.value) || 0 } : x,
+                                  ),
+                                })
+                              }
+                            />
+                          </div>
+                          <div>
+                            <Label className="text-xs">Deposit (₹)</Label>
+                            <Input
+                              type="number"
+                              min={0}
+                              value={t.securityDeposit}
+                              onChange={(e) =>
+                                setEditFormData({
+                                  ...editFormData,
+                                  roomTypes: getRoomTypes(editFormData).map((x) =>
+                                    x.sharing === t.sharing ? { ...x, securityDeposit: parseInt(e.target.value) || 0 } : x,
+                                  ),
+                                })
+                              }
+                            />
+                          </div>
+                        </div>
+                      ))}
+                      <p className="text-xs text-gray-500">
+                        New prices apply to new bookings. Current tenants keep the rent they booked at.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      <div>
+                        <Label>Rent (₹/month)</Label>
+                        <Input
+                          type="number"
+                          min={1}
+                          value={editFormData.rent ?? ''}
+                          onChange={(e) => setEditFormData({...editFormData, rent: parseInt(e.target.value) || 0})}
+                        />
+                      </div>
+                      <div>
+                        <Label>Security Deposit (₹)</Label>
+                        <Input
+                          type="number"
+                          min={0}
+                          value={editFormData.securityDeposit ?? ''}
+                          onChange={(e) => setEditFormData({...editFormData, securityDeposit: parseInt(e.target.value) || 0})}
+                        />
+                      </div>
+                    </>
+                  )}
+                  <div className="col-span-2">
+                    <RoomTypesEditor
+                      title={getRoomTypes(editFormData).length > 0 ? "Add another room type" : "Switch to room types (1/2/3 sharing)"}
+                      value={addedTypes}
+                      onChange={setAddedTypes}
+                      taken={getRoomTypes(editFormData).map((t) => t.sharing)}
+                      allowEmpty
                     />
                   </div>
                   <div>
@@ -1326,7 +1468,7 @@ export default function OwnerDashboard() {
                       <SelectContent>
                         <SelectItem value="male">Male</SelectItem>
                         <SelectItem value="female">Female</SelectItem>
-                        <SelectItem value="both">Both</SelectItem>
+                        <SelectItem value="any">Any</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

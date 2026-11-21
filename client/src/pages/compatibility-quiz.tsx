@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ArrowLeft, ArrowRight, CheckCircle } from "lucide-react";
 import { useLocation } from "wouter";
+import { useAuth } from "@/lib/auth-context";
 import { useToast } from "@/hooks/use-toast";
 
 const questions = [
@@ -87,6 +88,7 @@ const questions = [
 
 export default function CompatibilityQuiz() {
   const [, setLocation] = useLocation();
+  const { savePreferences } = useAuth();
   const [currentQuestion, setCurrentQuestion] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [isComplete, setIsComplete] = useState(false);
@@ -114,8 +116,9 @@ export default function CompatibilityQuiz() {
   };
 
   const completeQuiz = () => {
-    // Save preferences to localStorage
+    // Save to this browser AND to the account (so it is there after the next login)
     localStorage.setItem('userPreferences', JSON.stringify(answers));
+    savePreferences(answers).catch(() => {});
     setIsComplete(true);
     
     toast({

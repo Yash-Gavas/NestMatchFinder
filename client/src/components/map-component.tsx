@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { MapPin } from "lucide-react";
+import { isValidCoord } from "@shared/cities";
 
-// Extend Window interface for Leaflet
 declare global {
   interface Window {
     L: any;
@@ -14,105 +14,175 @@ interface MapComponentProps {
   properties?: Array<{
     id: number;
     name: string;
-    latitude?: string;
-    longitude?: string;
+    latitude?: string | null;
+    longitude?: string | null;
     rent?: number;
-    images?: string[];
+    images?: string[] | null;
     address?: string;
   }>;
+  selectedId?: number | null;
   height?: string;
 }
 
-export default function MapComponent({ 
-  latitude = "12.9716", 
-  longitude = "77.5946", 
-  properties = [], 
-  height = "400px" 
+// Load Leaflet exactly once, even if several maps mount at the same time
+let leafletPromise: Promise<any> | null = null;
+function loadLeaflet(): Promise<any> {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  if (window.L) return Promise.resolve(window.L);
+  if (leafletPromise) return leafletPromise;
+
+  leafletPromise = new Promise((resolve, reject) => {
+    if (!document.querySelector('link[data-leaflet-css]')) {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      link.setAttribute("data-leaflet-css", "1");
+      document.head.appendChild(link);
+    }
+    const script = document.createElement("script");
+    script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    script.onload = () => resolve(window.L);
+    script.onerror = () => {
+      leafletPromise = null; // allow a retry on the next mount
+      reject(new Error("Leaflet failed to load"));
+    };
+    document.head.appendChild(script);
+  });
+  return leafletPromise;
+}
+
+// Build popup with DOM nodes + textContent: property names/addresses are typed by
+// owners, so they must never be injected as HTML.
+function buildPopup(p: any): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.style.minWidth = "200px";
+  const img = document.createElement("img");
+  img.src = p.images?.[0] || "https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=200&h=120&fit=crop";
+  img.style.cssText = "width:100%;height:120px;object-fit:cover;border-radius:4px;margin-bottom:8px;";
+  const h = document.createElement("h3");
+  h.textContent = p.name || "";
+  h.style.cssText = "margin:0 0 4px 0;font-size:16px;font-weight:bold;";
+  const a = document.createElement("p");
+  a.textContent = p.address || "Address not available";
+  a.style.cssText = "margin:0 0 4px 0;color:#666;font-size:12px;";
+  const r = document.createElement("p");
+  r.textContent = `₹${Number(p.rent || 0).toLocaleString()}/month`;
+  r.style.cssText = "margin:0;font-size:14px;font-weight:bold;color:#059669;";
+  wrap.append(img, h, a, r);
+  return wrap;
+}
+
+export default function MapComponent({
+  latitude = "12.9716",
+  longitude = "77.5946",
+  properties = [],
+  selectedId = null,
+  height = "400px",
 }: MapComponentProps) {
   const [selectedProperty, setSelectedProperty] = useState<any>(null);
+  const [leaflet, setLeaflet] = useState<any>(typeof window !== "undefined" ? window.L : null);
+  const [failed, setFailed] = useState(false);
   const mapRef = useRef<HTMLDivElement>(null);
-  const [mapLoaded, setMapLoaded] = useState(false);
+  const mapInstance = useRef<any>(null);
+  const markerLayer = useRef<any>(null);
+  const markersById = useRef<Map<number, any>>(new Map());
+
+  const centerLat = parseFloat(latitude);
+  const centerLng = parseFloat(longitude);
+  const centerOk = Number.isFinite(centerLat) && Number.isFinite(centerLng);
 
   useEffect(() => {
-    // Load Leaflet CSS and JS for OpenStreetMap
-    const loadLeaflet = async () => {
-      if (typeof window !== 'undefined' && !window.L) {
-        // Add Leaflet CSS
-        const link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-        document.head.appendChild(link);
-
-        // Add Leaflet JS
-        const script = document.createElement('script');
-        script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-        script.onload = () => {
-          setMapLoaded(true);
-        };
-        document.head.appendChild(script);
-      } else if (window.L) {
-        setMapLoaded(true);
-      }
+    let alive = true;
+    loadLeaflet()
+      .then((L) => alive && setLeaflet(L))
+      .catch(() => alive && setFailed(true));
+    return () => {
+      alive = false;
     };
-
-    loadLeaflet();
   }, []);
 
+  // Create the map once
   useEffect(() => {
-    if (mapLoaded && mapRef.current && window.L) {
-      // Initialize the map
-      const map = window.L.map(mapRef.current).setView([parseFloat(latitude), parseFloat(longitude)], 13);
-
-      // Add OpenStreetMap tile layer
-      window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors',
+    if (!leaflet || !mapRef.current || mapInstance.current) return;
+    const map = leaflet.map(mapRef.current).setView(
+      [centerOk ? centerLat : 20.5937, centerOk ? centerLng : 78.9629],
+      centerOk ? 13 : 5,
+    );
+    leaflet
+      .tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "© OpenStreetMap contributors",
         maxZoom: 19,
-      }).addTo(map);
+      })
+      .addTo(map);
+    markerLayer.current = leaflet.layerGroup().addTo(map);
+    mapInstance.current = map;
+    setTimeout(() => map.invalidateSize(), 0);
+    return () => {
+      map.remove();
+      mapInstance.current = null;
+      markerLayer.current = null;
+      markersById.current.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leaflet]);
 
-      // Add property markers
-      console.log('Adding markers for properties:', properties);
-      properties.forEach((property, index) => {
-        console.log(`Property ${index}:`, {
-          name: property.name,
-          latitude: property.latitude,
-          longitude: property.longitude,
-          type: typeof property.latitude,
-          parsed: parseFloat(property.latitude || '0')
-        });
-        
-        const lat = property.latitude ? parseFloat(property.latitude) : parseFloat(latitude) + (Math.random() - 0.5) * 0.01;
-        const lng = property.longitude ? parseFloat(property.longitude) : parseFloat(longitude) + (Math.random() - 0.5) * 0.01;
-        
-        console.log(`Creating marker at [${lat}, ${lng}] for ${property.name}`);
-        const marker = window.L.marker([lat, lng]).addTo(map);
-        
-        const popupContent = `
-          <div style="min-width: 200px;">
-            <img src="${property.images?.[0] || 'https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=200&h=120&fit=crop'}" 
-                 style="width: 100%; height: 120px; object-fit: cover; border-radius: 4px; margin-bottom: 8px;" />
-            <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: bold;">${property.name}</h3>
-            <p style="margin: 0 0 4px 0; color: #666; font-size: 12px;">${property.address || 'Address not available'}</p>
-            <p style="margin: 0; font-size: 14px; font-weight: bold; color: #059669;">₹${property.rent || '8000'}/month</p>
-          </div>
-        `;
-        
-        marker.bindPopup(popupContent);
-        
-        marker.on('click', () => {
-          setSelectedProperty(property);
-        });
-      });
+  // Refresh markers whenever the properties change (map itself is kept)
+  useEffect(() => {
+    const map = mapInstance.current;
+    const layer = markerLayer.current;
+    if (!leaflet || !map || !layer) return;
 
-      // Cleanup function
-      return () => {
-        map.remove();
-      };
+    layer.clearLayers();
+    markersById.current.clear();
+    const points: [number, number][] = [];
+
+    properties.forEach((property) => {
+      if (!isValidCoord(property.latitude, property.longitude)) return; // never invent a position
+      const lat = Number(property.latitude);
+      const lng = Number(property.longitude);
+      const marker = leaflet.marker([lat, lng]).addTo(layer);
+      marker.bindPopup(buildPopup(property));
+      marker.on("click", () => setSelectedProperty(property));
+      markersById.current.set(property.id, marker);
+      points.push([lat, lng]);
+    });
+
+    if (points.length > 1) {
+      map.fitBounds(points, { padding: [40, 40], maxZoom: 15 });
+    } else if (points.length === 1) {
+      map.setView(points[0], 15);
+    } else if (centerOk) {
+      map.setView([centerLat, centerLng], 12);
     }
-  }, [mapLoaded, latitude, longitude, properties]);
+  }, [leaflet, properties, centerLat, centerLng, centerOk]);
 
-  if (!mapLoaded) {
+  // Focus a listing chosen from the list next to the map
+  useEffect(() => {
+    if (selectedId == null) return;
+    const marker = markersById.current.get(selectedId);
+    const map = mapInstance.current;
+    if (marker && map) {
+      map.setView(marker.getLatLng(), Math.max(map.getZoom(), 15));
+      marker.openPopup();
+    }
+  }, [selectedId]);
+
+  if (failed) {
     return (
-      <div 
+      <div className="w-full rounded-lg border flex items-center justify-center text-center p-4" style={{ height }}>
+        <div>
+          <MapPin className="h-8 w-8 text-gray-400 mx-auto mb-2" />
+          <p className="text-gray-600 dark:text-gray-400 text-sm">
+            The map could not be loaded. Check your internet connection and reload the page.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!leaflet) {
+    return (
+      <div
         className="w-full bg-gradient-to-br from-blue-50 to-green-50 dark:from-blue-900 dark:to-green-900 rounded-lg relative overflow-hidden border flex items-center justify-center"
         style={{ height }}
       >
@@ -124,33 +194,34 @@ export default function MapComponent({
     );
   }
 
+  const pinCount = properties.filter((p) => isValidCoord(p.latitude, p.longitude)).length;
+
   return (
-    <div 
-      className="w-full rounded-lg relative overflow-hidden border"
-      style={{ height }}
-    >
+    <div className="w-full rounded-lg relative z-0 isolate overflow-hidden border" style={{ height }}>
       <div ref={mapRef} className="w-full h-full" />
 
-      {/* Property popup for selected property */}
+      {pinCount === 0 && (
+        <div className="absolute inset-x-4 top-14 z-[1000] rounded-md bg-white/95 dark:bg-gray-800/95 border p-2 text-center text-xs text-gray-600 dark:text-gray-300">
+          No properties here have a map location yet.
+        </div>
+      )}
+
       {selectedProperty && (
-        <div className="absolute bottom-4 left-4 right-4 bg-white dark:bg-gray-800 rounded-lg shadow-xl border p-4 animate-in slide-in-from-bottom-2">
+        <div className="absolute bottom-4 left-4 right-4 z-[1000] bg-white dark:bg-gray-800 rounded-lg shadow-xl border p-4">
           <div className="flex items-center space-x-3">
             <img
               src={selectedProperty.images?.[0] || "https://images.unsplash.com/photo-1555854877-bab0e564b8d5?w=80&h=80&fit=crop"}
               alt={selectedProperty.name}
               className="w-16 h-16 rounded-lg object-cover"
             />
-            <div className="flex-1">
-              <h3 className="font-semibold text-gray-900 dark:text-white">{selectedProperty.name}</h3>
-              <p className="text-sm text-gray-500">{selectedProperty.address}</p>
-              <p className="text-lg font-bold text-primary">₹{selectedProperty.rent}/month</p>
-              <div className="flex items-center mt-1">
-                <MapPin className="w-3 h-3 text-gray-400 mr-1" />
-                <span className="text-xs text-gray-400">Interactive OpenStreetMap</span>
-              </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-gray-900 dark:text-white truncate">{selectedProperty.name}</h3>
+              <p className="text-sm text-gray-500 truncate">{selectedProperty.address}</p>
+              <p className="text-lg font-bold text-primary">₹{Number(selectedProperty.rent || 0).toLocaleString()}/month</p>
             </div>
             <button
               onClick={() => setSelectedProperty(null)}
+              aria-label="Close"
               className="text-gray-400 hover:text-gray-600 text-xl font-bold"
             >
               ×
@@ -159,21 +230,10 @@ export default function MapComponent({
         </div>
       )}
 
-      {/* Map info overlay */}
-      <div className="absolute top-4 right-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-3">
+      <div className="absolute top-4 right-4 z-[1000] bg-white dark:bg-gray-800 rounded-lg shadow-lg p-3">
         <div className="text-center">
-          <p className="text-sm font-medium text-gray-900 dark:text-white">{properties.length} Properties</p>
+          <p className="text-sm font-medium text-gray-900 dark:text-white">{pinCount} Properties</p>
           <p className="text-xs text-gray-500">OpenStreetMap</p>
-        </div>
-      </div>
-
-      {/* Location info */}
-      <div className="absolute top-4 left-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-2">
-        <div className="flex items-center space-x-2">
-          <MapPin className="w-4 h-4 text-primary" />
-          <span className="text-xs text-gray-600 dark:text-gray-400">
-            {parseFloat(latitude).toFixed(3)}, {parseFloat(longitude).toFixed(3)}
-          </span>
         </div>
       </div>
     </div>

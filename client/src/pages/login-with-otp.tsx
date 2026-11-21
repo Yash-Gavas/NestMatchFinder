@@ -8,10 +8,12 @@ import { useLocation, Link } from "wouter";
 import Logo from "@/components/logo";
 import { Mail, ArrowRight, ArrowLeft, AlertCircle } from "lucide-react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { useAuth, postLoginPath } from "@/lib/auth-context";
 
 export default function LoginWithOtp() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
+  const { login } = useAuth();
   const [step, setStep] = useState<"email" | "otp">("email");
   const [email, setEmail] = useState("");
   const [userType, setUserType] = useState<"user" | "owner">("user");
@@ -85,18 +87,14 @@ export default function LoginWithOtp() {
         throw new Error(data.message || "Invalid or expired OTP");
       }
 
-      localStorage.setItem("authToken", data.token);
-      localStorage.setItem("userType", data.user?.userType || userType);
-      localStorage.setItem("userEmail", data.user?.email || email);
-      localStorage.setItem("user", JSON.stringify(data.user));
+      login(data.token, data.user);
 
       toast({
         title: "Login successful",
         description: "Welcome to NestMatch!",
       });
 
-      const role = data.user?.userType || userType;
-      setLocation(role === "owner" ? "/dashboard/owner" : "/dashboard/user");
+      setLocation(postLoginPath(data.user));
     } catch (err: any) {
       toast({
         title: "Verification failed",

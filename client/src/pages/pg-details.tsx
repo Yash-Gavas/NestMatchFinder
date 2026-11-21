@@ -12,7 +12,7 @@ import { useLocation } from "wouter";
 import { useToast } from "@/hooks/use-toast";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
-import { useAuth } from "@/lib/auth-simple";
+import { useAuth } from "@/lib/auth-context";
 import type { Property } from "@shared/schema";
 import MapComponent from "@/components/map-component";
 
@@ -305,7 +305,7 @@ export default function PGDetails() {
         console.log("Dialog state changing to:", open);
         setBookingDialogOpen(open);
       }}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Book {property.name}</DialogTitle>
           </DialogHeader>

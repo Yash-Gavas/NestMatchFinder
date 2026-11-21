@@ -156,6 +156,26 @@ export async function initializeDatabase() {
       );
     `);
 
+    // Migrations for databases created before these columns existed
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS profession TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS company TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS "profilePhoto" TEXT;
+      ALTER TABLE properties ADD COLUMN IF NOT EXISTS "securityDeposit" INTEGER DEFAULT 0;
+      ALTER TABLE properties ADD COLUMN IF NOT EXISTS "totalRooms" INTEGER;
+      ALTER TABLE properties ADD COLUMN IF NOT EXISTS "roomTypes" JSONB;
+      ALTER TABLE bookings ADD COLUMN IF NOT EXISTS "sharing" INTEGER;
+      -- old bookings were saved with a hardcoded 10500/5000: restore the property's real figures
+      UPDATE bookings b SET rent = p.rent, "securityDeposit" = COALESCE(p."securityDeposit", 0)
+        FROM properties p
+        WHERE b."propertyId" = p.id AND b.rent = 10500 AND b."securityDeposit" = 5000
+          AND (p.rent <> 10500 OR COALESCE(p."securityDeposit", 0) <> 5000);
+      UPDATE bookings SET status = 'removed' WHERE status IN ('completed', 'active', 'cancelled');
+      UPDATE rent_payments SET status = 'paid' WHERE status IN ('confirmed_by_owner', 'completed');
+      UPDATE rent_payments SET status = 'submitted' WHERE status IN ('pending', 'confirmed_by_user');
+    `);
+
     console.log('✅ Database tables initialized successfully');
   } catch (error) {
     console.log('⚠️  Database initialization skipped or failed (tables may already exist):', (error as Error).message);

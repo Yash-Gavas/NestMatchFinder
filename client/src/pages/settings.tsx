@@ -17,13 +17,13 @@ import { useTheme } from "@/components/theme-provider";
 import { useLocation } from "wouter";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
-import { useAuth } from "@/lib/auth-simple";
+import { useAuth } from "@/lib/auth-context";
 
 export default function SettingsPage() {
   const { theme, setTheme } = useTheme();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
-  const { user } = useAuth();
+  const { user, logout, updateUser, savePreferences } = useAuth();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -48,37 +48,18 @@ export default function SettingsPage() {
     preferences: {}
   });
 
-  // 1. Auth Guard: block access if not logged in
+  // 1. Access is already restricted by <ProtectedRoute>; just load the session user.
   useEffect(() => {
-    const token = localStorage.getItem("authToken");
-    const storedUserRaw = localStorage.getItem("user");
-    let parsedStoredUser = null;
-
-    try {
-      parsedStoredUser = storedUserRaw ? JSON.parse(storedUserRaw) : null;
-    } catch {
-      parsedStoredUser = null;
-    }
-
-    const resolvedUser = user || parsedStoredUser;
-
-    if (!token && !resolvedUser) {
-      toast({
-        title: "Authentication Required",
-        description: "Please sign in to access your settings.",
-        variant: "destructive",
-      });
-      setLocation("/login");
-      return;
-    }
-
-    setActiveUser(resolvedUser);
+    setActiveUser(user);
     setIsCheckingAuth(false);
-  }, [user, setLocation, toast]);
+  }, [user]);
 
   // 2. Populate form fields once authenticated user is resolved
   useEffect(() => {
     if (activeUser) {
+      const n = (activeUser.preferences || {}).notifications || {};
+      setNotificationsEnabled(n.push !== false);
+      setEmailNotifications(n.email !== false);
       setProfileData({
         firstName: activeUser.firstName || "",
         lastName: activeUser.lastName || "",
@@ -140,18 +121,28 @@ export default function SettingsPage() {
   };
 
   const handleLogout = () => {
-    localStorage.removeItem("userPreferences");
-    localStorage.removeItem("authToken");
-    localStorage.removeItem("userType");
-    localStorage.removeItem("userEmail");
-    localStorage.removeItem("user");
+    logout();
 
     toast({
       title: "Logged Out",
       description: "You have been successfully logged out.",
     });
 
-    setLocation("/login");
+    setLocation("/");
+  };
+
+  const saveNotifications = async (push: boolean, email: boolean) => {
+    setNotificationsEnabled(push);
+    setEmailNotifications(email);
+    try {
+      await savePreferences({ notifications: { push, email } });
+    } catch {
+      toast({
+        title: "Could not save",
+        description: "Notification settings were not saved. Please try again.",
+        variant: "destructive",
+      });
+    }
   };
 
   const updateProfileMutation = useMutation({
@@ -160,20 +151,20 @@ export default function SettingsPage() {
       return response.json();
     },
     onSuccess: (savedUser) => {
-      const mergedUser = { ...activeUser, ...profileData, ...(savedUser || {}) };
+      const { preferences: _p, ...shown } = profileData;
+      const mergedUser = { ...activeUser, ...shown, ...(savedUser || {}) };
       setActiveUser(mergedUser);
-      localStorage.setItem("user", JSON.stringify(mergedUser));
-      queryClient.invalidateQueries({ queryKey: ["/api/auth/login"] });
+      updateUser(mergedUser);
 
       toast({
         title: "Profile Updated",
         description: "Your profile and photo have been saved.",
       });
     },
-    onError: () => {
+    onError: (err: any) => {
       toast({
         title: "Update Failed",
-        description: "Failed to save profile changes. Please try again.",
+        description: err?.message || "Failed to save profile changes. Please try again.",
         variant: "destructive",
       });
     }
@@ -190,8 +181,10 @@ export default function SettingsPage() {
       return;
     }
 
+    // preferences (quiz answers, notification toggles) are saved by their own controls
+    const { preferences: _prefs, email: _email, ...editable } = profileData;
     const updatedData = {
-      ...profileData,
+      ...editable,
       name: `${profileData.firstName} ${profileData.lastName}`.trim(),
       age: profileData.age ? parseInt(profileData.age) : null,
       profilePhoto: profileData.avatar,
@@ -202,11 +195,7 @@ export default function SettingsPage() {
 
   const handleDeleteAccount = () => {
     if (confirm("Are you sure you want to delete your account? This action cannot be undone.")) {
-      localStorage.removeItem("userPreferences");
-      localStorage.removeItem("authToken");
-      localStorage.removeItem("userType");
-      localStorage.removeItem("userEmail");
-      localStorage.removeItem("user");
+      logout();
 
       toast({
         title: "Account Deleted",
@@ -223,7 +212,7 @@ export default function SettingsPage() {
   }
 
   const dashboardRoute =
-    (activeUser.userType || localStorage.getItem("userType")) === "owner"
+    activeUser.userType === "owner"
       ? "/dashboard/owner"
       : "/dashboard/user";
 
@@ -348,7 +337,8 @@ export default function SettingsPage() {
                       id="email"
                       type="email"
                       value={profileData.email}
-                      onChange={(e) => setProfileData((prev) => ({ ...prev, email: e.target.value }))}
+                      disabled
+                      readOnly
                     />
                   </div>
                   <div>
@@ -467,7 +457,7 @@ export default function SettingsPage() {
                   <Switch
                     id="push-notifications"
                     checked={notificationsEnabled}
-                    onCheckedChange={setNotificationsEnabled}
+                    onCheckedChange={(v) => saveNotifications(v, emailNotifications)}
                   />
                 </div>
 
@@ -483,7 +473,7 @@ export default function SettingsPage() {
                   <Switch
                     id="email-notifications"
                     checked={emailNotifications}
-                    onCheckedChange={setEmailNotifications}
+                    onCheckedChange={(v) => saveNotifications(notificationsEnabled, v)}
                   />
                 </div>
               </CardContent>

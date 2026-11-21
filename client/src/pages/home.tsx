@@ -10,6 +10,7 @@ import type { Property } from "@shared/schema";
 import LocationAutocomplete from "@/components/location-autocomplete";
 
 // City templates for display - only show cities that have actual properties
+import { cityKey, normalizeCity, detectCity } from "@shared/cities";
 const cityTemplates = [
   {
     name: 'Mumbai',
@@ -87,20 +88,34 @@ export default function Home() {
     queryKey: ["/api/properties"],
   });
 
-  // Calculate real city data from actual properties
-  const cityData = cityTemplates.map(template => {
-    const cityProperties = properties.filter(property => 
-      property.city.toLowerCase() === template.name.toLowerCase()
-    );
-    const pgCount = cityProperties.length;
-    const startingRent = pgCount > 0 ? Math.min(...cityProperties.map(p => p.rent)) : 0;
-    
-    return {
-      ...template,
-      pgCount,
-      startingRent
+  // Build the city cards from the real properties. Cities are compared after
+  // normalisation ("Bengaluru" == "Bangalore", extra spaces / case ignored) and a
+  // city that has PGs but no template card still gets a card of its own.
+  const cityData = (() => {
+    const byCity = new Map<string, Property[]>();
+    for (const p of properties) {
+      const key = cityKey(p.city);
+      if (!key) continue;
+      byCity.set(key, [...(byCity.get(key) || []), p]);
+    }
+    const stats = (name: string) => {
+      const list = byCity.get(cityKey(name)) || [];
+      const rents = list.map((p) => Number(p.rent)).filter((r) => r > 0);
+      return {
+        pgCount: list.length,
+        startingRent: rents.length ? Math.min(...rents) : 0,
+      };
     };
-  });
+    const known = new Set(cityTemplates.map((t) => cityKey(t.name)));
+    const extra = Array.from(byCity.keys())
+      .filter((k) => !known.has(k))
+      .map((k) => ({
+        name: normalizeCity(k),
+        imageUrl:
+          "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?w=400&h=300&fit=crop&auto=format",
+      }));
+    return [...cityTemplates, ...extra].map((c) => ({ ...c, ...stats(c.name) }));
+  })();
 
   const handleCityClick = (cityName: string) => {
     setLocation(`/city-map?city=${encodeURIComponent(cityName)}`);
@@ -113,7 +128,7 @@ export default function Home() {
     if (budget) params.set('budget', budget);
     
     // Extract city from search location or use default
-    const cityFromSearch = searchLocation.split(',').pop()?.trim() || 'Bangalore';
+    const cityFromSearch = detectCity(searchLocation) || searchLocation.split(',')[0]?.trim() || 'Bangalore';
     params.set('city', cityFromSearch);
     
     setLocation(`/city-map?${params.toString()}`);

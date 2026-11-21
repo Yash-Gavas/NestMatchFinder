@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { db } from "./db";
 import { users, properties, bookings, reviews, favorites, verificationDocuments, rentPayments } from "@shared/schema";
-import { eq } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import type { IStorage } from "./storage";
 import type { User, InsertUser, Property, InsertProperty, Booking, InsertBooking, Review, InsertReview, Favorite, InsertFavorite, VerificationDocument, InsertVerificationDocument, RentPayment, InsertRentPayment } from "@shared/schema";
 
@@ -109,6 +109,7 @@ export class DatabaseStorage implements IStorage {
         status: bookings.status,
         rent: bookings.rent,
         securityDeposit: bookings.securityDeposit,
+        sharing: bookings.sharing,
         compatibilityScore: bookings.compatibilityScore,
         requestedDate: bookings.requestedDate,
         approvedDate: bookings.approvedDate,
@@ -119,6 +120,7 @@ export class DatabaseStorage implements IStorage {
         propertyName: properties.name,
         propertyAddress: properties.address,
         propertyCity: properties.city,
+        propertyRent: properties.rent,
       })
       .from(bookings)
       .innerJoin(properties, eq(bookings.propertyId, properties.id))
@@ -139,17 +141,25 @@ export class DatabaseStorage implements IStorage {
         status: bookings.status,
         rent: bookings.rent,
         securityDeposit: bookings.securityDeposit,
+        sharing: bookings.sharing,
         compatibilityScore: bookings.compatibilityScore,
         requestedDate: bookings.requestedDate,
         approvedDate: bookings.approvedDate,
         moveInDate: bookings.moveInDate,
         moveOutDate: bookings.moveOutDate,
         createdAt: bookings.createdAt,
-        // User details
-               // User details
-        userName: users.firstName,
+        // Tenant details (so the owner can decide who to approve)
+        userFirstName: users.firstName,
+        userLastName: users.lastName,
+        userName: users.name,
         userEmail: users.email,
         userPhone: users.phone,
+        userAge: users.age,
+        userGender: users.gender,
+        userOccupation: users.occupation,
+        userProfession: users.profession,
+        userCompany: users.company,
+        userPreferences: users.preferences,
         // Property details
         propertyName: properties.name,
         propertyCity: properties.city,
@@ -236,12 +246,39 @@ export class DatabaseStorage implements IStorage {
     return await db.select().from(rentPayments).where(eq(rentPayments.bookingId, bookingId));
   }
 
+  async getRentPayment(id: number): Promise<RentPayment | undefined> {
+    const [payment] = await db.select().from(rentPayments).where(eq(rentPayments.id, id));
+    return payment;
+  }
+
   async getRentPaymentsByUser(userId: number): Promise<RentPayment[]> {
     return await db.select().from(rentPayments).where(eq(rentPayments.userId, userId));
   }
 
-  async getRentPaymentsByOwner(ownerId: number): Promise<RentPayment[]> {
-    return await db.select().from(rentPayments).where(eq(rentPayments.ownerId, ownerId));
+  // rent_payments has no ownerId column: go through the property's owner.
+  async getRentPaymentsByOwner(ownerId: number): Promise<any[]> {
+    return await db
+      .select({
+        id: rentPayments.id,
+        bookingId: rentPayments.bookingId,
+        userId: rentPayments.userId,
+        propertyId: rentPayments.propertyId,
+        amount: rentPayments.amount,
+        paymentMonth: rentPayments.paymentMonth,
+        paymentDate: rentPayments.paymentDate,
+        status: rentPayments.status,
+        paymentMethod: rentPayments.paymentMethod,
+        notes: rentPayments.notes,
+        propertyName: properties.name,
+        tenantName: users.name,
+        tenantFirstName: users.firstName,
+        tenantLastName: users.lastName,
+        tenantPhone: users.phone,
+      })
+      .from(rentPayments)
+      .innerJoin(properties, eq(rentPayments.propertyId, properties.id))
+      .innerJoin(users, eq(rentPayments.userId, users.id))
+      .where(eq(properties.ownerId, ownerId));
   }
 
   async createRentPayment(insertPayment: InsertRentPayment): Promise<RentPayment> {
@@ -252,12 +289,37 @@ export class DatabaseStorage implements IStorage {
     return payment;
   }
 
-  async updateRentPaymentStatus(id: number, status: string): Promise<RentPayment | undefined> {
+  async updateRentPayment(id: number, updates: Partial<RentPayment>): Promise<RentPayment | undefined> {
     const [payment] = await db
       .update(rentPayments)
-      .set({ status })
+      .set(updates)
       .where(eq(rentPayments.id, id))
       .returning();
     return payment;
+  }
+
+  async updateRentPaymentStatus(id: number, status: string): Promise<RentPayment | undefined> {
+    return this.updateRentPayment(id, { status });
+  }
+
+  // How many beds are currently spoken for on a property
+  async countBedHolders(propertyId: number, sharing?: number): Promise<number> {
+    const rows = await db
+      .select({ id: bookings.id, sharing: bookings.sharing })
+      .from(bookings)
+      .where(and(eq(bookings.propertyId, propertyId), inArray(bookings.status, ["pending", "approved"])));
+    return sharing == null ? rows.length : rows.filter((r) => r.sharing === sharing).length;
+  }
+
+  async getActiveBookingForUserAndProperty(userId: number, propertyId: number): Promise<Booking | undefined> {
+    const [b] = await db
+      .select()
+      .from(bookings)
+      .where(and(
+        eq(bookings.userId, userId),
+        eq(bookings.propertyId, propertyId),
+        inArray(bookings.status, ["pending", "approved"]),
+      ));
+    return b;
   }
 }

@@ -73,6 +73,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     }
   });
 
+  // Unknown API paths must 404 as JSON (not fall through to index.html)
+  app.use("/api", (req: Request, res: Response) => {
+    res.status(404).json({ message: `API route not found: ${req.method} ${req.originalUrl}` });
+  });
+
   if (process.env.NODE_ENV === "development" || app.get("env") === "development") {
     await setupVite(app, server);
   } else {

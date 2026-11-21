@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
-import { useAuth } from "@/lib/auth-simple";
+import { useAuth } from "@/lib/auth-context";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -16,9 +16,13 @@ import MapComponent from "@/components/map-component";
 import { calculateCompatibilityScore } from "@/lib/compatibility";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation } from "wouter";
+import TenantPayments from "@/components/tenant-payments";
+import { RoomTypeList, priceLabel } from "@/components/room-types";
+import { sharingLabel, getRoomTypes } from "@shared/roomtypes";
+import { cityKey, CITY_COORDS, isValidCoord, SUPPORTED_CITIES } from "@shared/cities";
 
 export default function UserDashboard() {
-  const { user } = useAuth();
+  const { user, logout, savePreferences: saveAccountPreferences } = useAuth();
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState("browse");
   const [searchQuery, setSearchQuery] = useState("");
@@ -70,10 +74,8 @@ export default function UserDashboard() {
   });
 
   const handleLogout = () => {
-    localStorage.removeItem('userType');
-    localStorage.removeItem('userEmail');
-    localStorage.removeItem('userPreferences');
-    
+    logout();
+
     toast({
       title: "Logged Out",
       description: "You have been logged out successfully.",
@@ -102,6 +104,7 @@ export default function UserDashboard() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [`/api/bookings/user/${user?.id}`] });
+      queryClient.invalidateQueries({ queryKey: ["/api/properties"] });
       toast({
         title: "Booking Request Sent",
         description: `Your booking request for ${selectedProperty?.name} has been sent to the owner.`,
@@ -137,6 +140,7 @@ export default function UserDashboard() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [`/api/bookings/user/${user?.id}`] });
+      queryClient.invalidateQueries({ queryKey: ["/api/properties"] }); // bed is released
       toast({
         title: "Booking Cancelled",
         description: "Your booking request has been cancelled successfully.",
@@ -197,7 +201,7 @@ export default function UserDashboard() {
 
   const savePreferences = async () => {
     try {
-      localStorage.setItem('userPreferences', JSON.stringify(preferences));
+      await saveAccountPreferences(preferences);
       
       toast({
         title: "Preferences Saved",
@@ -229,7 +233,8 @@ const userPreferences = getUserPreferences();
       property.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
       property.city?.toLowerCase().includes(searchQuery.toLowerCase());
     
-    const matchesFilters = (!filters.minRent || property.rent >= parseInt(filters.minRent)) &&
+    const matchesCity = !filters.city || filters.city === "all" || cityKey(property.city) === cityKey(filters.city);
+    const matchesFilters = matchesCity && (!filters.minRent || Math.max(property.rent, ...getRoomTypes(property).map((t) => t.rent)) >= parseInt(filters.minRent)) &&
       (!filters.maxRent || property.rent <= parseInt(filters.maxRent)) &&
       (filters.gender === "all" || property.gender === filters.gender);
     
@@ -248,6 +253,14 @@ const userPreferences = getUserPreferences();
     setBookingDialogOpen(false);
     setSelectedProperty(null);
   };
+
+  const pinnedForMap = (filteredProperties as any[]).filter((p) => isValidCoord(p.latitude, p.longitude));
+  const mapCenter = pinnedForMap.length
+    ? {
+        lat: pinnedForMap.reduce((t, p) => t + Number(p.latitude), 0) / pinnedForMap.length,
+        lng: pinnedForMap.reduce((t, p) => t + Number(p.longitude), 0) / pinnedForMap.length,
+      }
+    : (filters.city && filters.city !== "all" && CITY_COORDS[filters.city]) || CITY_COORDS.Bangalore;
 
   if (propertiesLoading) {
     return (
@@ -370,11 +383,12 @@ const userPreferences = getUserPreferences();
                       </p>
                       
                       <div className="flex items-center justify-between mb-3">
-                        <span className="text-xl font-bold text-primary">₹{property.rent?.toLocaleString()}/month</span>
+                        <span className="text-xl font-bold text-primary">{priceLabel(property)}/month</span>
                         <Badge variant="secondary" className="text-xs">
                           {property.gender}
                         </Badge>
                       </div>
+                      <div className="mb-3 -mt-1"><RoomTypeList property={property} compact /></div>
                       
                       {compatibilityScore && (
                         <div className="mb-3">
@@ -483,16 +497,24 @@ const userPreferences = getUserPreferences();
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">All Cities</SelectItem>
-                    <SelectItem value="Bangalore">Bangalore</SelectItem>
-                    <SelectItem value="Mumbai">Mumbai</SelectItem>
-                    <SelectItem value="Delhi">Delhi</SelectItem>
-                    <SelectItem value="Pune">Pune</SelectItem>
-                    <SelectItem value="Chennai">Chennai</SelectItem>
-                    <SelectItem value="Hyderabad">Hyderabad</SelectItem>
+                    {SUPPORTED_CITIES.map((c) => (
+                      <SelectItem key={c} value={c}>{c}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>
             </div>
+
+            <Card className="overflow-hidden">
+              <CardContent className="p-0">
+                <MapComponent
+                  latitude={String(mapCenter.lat)}
+                  longitude={String(mapCenter.lng)}
+                  properties={filteredProperties}
+                  height="460px"
+                />
+              </CardContent>
+            </Card>
 
             <Card className="overflow-hidden">
               <CardContent className="p-6">
@@ -513,10 +535,10 @@ const userPreferences = getUserPreferences();
                           {property.city}
                         </p>
                         <div className="flex justify-between items-center">
-                          <span className="text-lg font-bold text-primary">₹{property.rent?.toLocaleString()}/month</span>
+                          <span className="text-lg font-bold text-primary">{priceLabel(property)}/month</span>
                           <div className="flex items-center">
                             <Star className="w-4 h-4 text-yellow-400 mr-1" />
-                            <span className="text-sm">{parseFloat(property.rating || '4.0').toFixed(2)}</span>
+                            <span className="text-sm">{Number(property.averageRating) > 0 ? Number(property.averageRating).toFixed(1) : "New"}</span>
                           </div>
                         </div>
                         <div className="mt-2 text-center">
@@ -537,25 +559,9 @@ const userPreferences = getUserPreferences();
               </CardContent>
             </Card>
 
-            {/* Property Legend */}
-            <div className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700">
-              <h3 className="text-lg font-semibold mb-3">Map Legend</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
-                <div className="flex items-center">
-                  <div className="w-4 h-4 bg-green-500 rounded-full mr-2"></div>
-                  <span>Available beds {'>'}  3</span>
-                </div>
-                <div className="flex items-center">
-                  <div className="w-4 h-4 bg-yellow-500 rounded-full mr-2"></div>
-                  <span>Available beds 1-3</span>
-                </div>
-                <div className="flex items-center">
-                  <div className="w-4 h-4 bg-red-500 rounded-full mr-2"></div>
-                  <span>No available beds</span>
-                </div>
-              </div>
-              <p className="text-gray-600 dark:text-gray-400 mt-2">Click on any marker to view property details and book directly.</p>
-            </div>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Click a marker to see the PG, or a card below to book it.
+            </p>
           </TabsContent>
 
           <TabsContent value="bookings" className="space-y-6">
@@ -576,7 +582,14 @@ const userPreferences = getUserPreferences();
                           <div>
                             <h3 className="font-semibold">{booking.propertyName}</h3>
                             <p className="text-sm text-gray-500">{booking.propertyAddress}</p>
-                            <p className="text-sm font-medium">₹{booking.rent}/month</p>
+                            <p className="text-sm font-medium">
+                              {booking.sharing ? `${sharingLabel(booking.sharing)} • ` : ""}₹{Number(booking.rent).toLocaleString()}/month • Deposit ₹{Number(booking.securityDeposit || 0).toLocaleString()}
+                            </p>
+                            {booking.moveInDate && (
+                              <p className="text-xs text-gray-500">
+                                Move-in {new Date(booking.moveInDate).toLocaleDateString()}
+                              </p>
+                            )}
                           </div>
                         </div>
                         
@@ -587,7 +600,7 @@ const userPreferences = getUserPreferences();
                               booking.status === "approved" ? "default" : "destructive"
                             }
                           >
-                            {booking.status}
+                            {{ pending: "Waiting for owner", approved: "Approved", rejected: "Rejected", removed: "Removed by owner" }[booking.status as string] || booking.status}
                           </Badge>
                           
                           {booking.status === "pending" && (
@@ -620,7 +633,7 @@ const userPreferences = getUserPreferences();
             <TabsContent value="properties" className="space-y-6">
               <div className="flex items-center justify-between">
                 <h2 className="text-2xl font-bold">My Properties</h2>
-                <Button onClick={() => setLocation('/owner-dashboard')}>
+                <Button onClick={() => setLocation('/dashboard/owner')}>
                   <Settings className="w-4 h-4 mr-2" />
                   Add New Property
                 </Button>
@@ -661,7 +674,7 @@ const userPreferences = getUserPreferences();
                         </div>
                         
                         <div className="flex items-center justify-between mb-4">
-                          <span className="text-2xl font-bold text-primary">₹{property.rent?.toLocaleString()}</span>
+                          <span className="text-2xl font-bold text-primary">{priceLabel(property)}</span>
                           <div className="text-sm text-gray-500">
                             <span className="text-green-600 font-medium">{property.availableBeds}</span> of {property.totalBeds} beds available
                           </div>
@@ -704,7 +717,7 @@ const userPreferences = getUserPreferences();
                   <Settings className="w-12 h-12 text-gray-400 mx-auto mb-4" />
                   <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">No properties listed</h3>
                   <p className="text-gray-600 dark:text-gray-400 mb-4">Start by adding your first property to attract potential tenants.</p>
-                  <Button onClick={() => setLocation('/owner-dashboard')}>
+                  <Button onClick={() => setLocation('/dashboard/owner')}>
                     <Settings className="w-4 h-4 mr-2" />
                     Add Your First Property
                   </Button>
@@ -729,7 +742,7 @@ const userPreferences = getUserPreferences();
                       <h3 className="text-lg font-semibold mb-2">{property.name}</h3>
                       <p className="text-gray-600 dark:text-gray-400 text-sm mb-2">{property.address}</p>
                       <div className="flex items-center justify-between">
-                        <span className="text-xl font-bold text-primary">₹{property.rent?.toLocaleString()}/month</span>
+                        <span className="text-xl font-bold text-primary">{priceLabel(property)}/month</span>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -757,13 +770,10 @@ const userPreferences = getUserPreferences();
 
           <TabsContent value="payments" className="space-y-6">
             <h2 className="text-2xl font-bold">Rent Payments</h2>
-            
-            <div className="text-center py-8">
-              <CreditCard className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-              <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">No active bookings</h3>
-              <p className="text-gray-600 dark:text-gray-400 mb-4">Make a booking to start tracking rent payments.</p>
-              <Button onClick={() => setActiveTab("browse")}>Browse Properties</Button>
-            </div>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Choose cash or online for each month. The owner then approves it and it shows as Paid.
+            </p>
+            <TenantPayments userId={user?.id} bookings={userBookings as any[]} />
           </TabsContent>
         </Tabs>
 
@@ -955,7 +965,7 @@ const userPreferences = getUserPreferences();
                       View on Map
                     </Button>
                     <Button variant="outline" size="sm" onClick={() => {
-                      setLocation('/owner-dashboard');
+                      setLocation('/dashboard/owner');
                       setManageDialogOpen(false);
                     }}>
                       <Settings className="w-4 h-4 mr-2" />
@@ -1025,7 +1035,7 @@ const userPreferences = getUserPreferences();
                     Close
                   </Button>
                   <Button onClick={() => {
-                    setLocation('/owner-dashboard');
+                    setLocation('/dashboard/owner');
                     setManageDialogOpen(false);
                   }}>
                     <Settings className="w-4 h-4 mr-2" />

@@ -14,6 +14,10 @@ export const users = pgTable("users", {
   age: integer("age"),
   gender: text("gender"), // 'male', 'female', 'other'
   occupation: text("occupation"),
+  profession: text("profession"),
+  company: text("company"),
+  bio: text("bio"),
+  profilePhoto: text("profilePhoto"),
   userType: text("userType").notNull(), // 'user' or 'owner'
   isVerified: boolean("isVerified").default(false),
   preferences: jsonb("preferences"), // lifestyle preferences for compatibility
@@ -32,6 +36,9 @@ export const properties = pgTable("properties", {
   latitude: text("latitude"),
   longitude: text("longitude"),
   rent: integer("rent").notNull(),
+  securityDeposit: integer("securityDeposit").default(0),
+  totalRooms: integer("totalRooms"),
+  roomTypes: jsonb("roomTypes"), // [{sharing, rent, securityDeposit, totalBeds, availableBeds}]
   totalBeds: integer("totalBeds").notNull(),
   availableBeds: integer("availableBeds").notNull(),
   gender: text("gender").notNull(), // 'male', 'female', 'any'
@@ -47,12 +54,13 @@ export const bookings = pgTable("bookings", {
   id: serial("id").primaryKey(),
   userId: integer("userId").notNull(),
   propertyId: integer("propertyId").notNull(),
-  status: text("status").notNull(), // 'pending', 'approved', 'rejected', 'active', 'completed'
+  status: text("status").notNull(), // 'pending', 'approved', 'rejected', 'cancelled', 'removed'
   compatibilityScore: decimal("compatibilityScore"),
   requestedDate: timestamp("requestedDate"),
   approvedDate: timestamp("approvedDate"),
   moveInDate: timestamp("moveInDate"),
   moveOutDate: timestamp("moveOutDate"),
+  sharing: integer("sharing"), // room type booked (1, 2, 3 ... sharing); null for old bookings
   rent: integer("rent").notNull(),
   securityDeposit: integer("securityDeposit"),
   createdAt: timestamp("createdAt").defaultNow(),
@@ -91,7 +99,7 @@ export const rentPayments = pgTable("rent_payments", {
   amount: integer("amount").notNull(),
   paymentMonth: text("paymentMonth").notNull(), // Format: "2024-01"
   paymentDate: timestamp("paymentDate").notNull(),
-  status: text("status").notNull(), // 'paid', 'pending', 'overdue'
+  status: text("status").notNull(), // 'submitted' (tenant says paid), 'paid' (owner approved), 'rejected'
   paymentMethod: text("paymentMethod").default("manual"), // 'manual', 'online', 'cash'
   notes: text("notes"),
   createdAt: timestamp("createdAt").defaultNow(),

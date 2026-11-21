@@ -3,7 +3,7 @@ import { Star } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { useAuth } from "@/lib/auth-simple";
+import { useAuth } from "@/lib/auth-context";
 
 interface StarRatingProps {
   propertyId: number;

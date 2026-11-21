@@ -95,7 +95,7 @@ export default function Contact() {
                   <div>
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Phone</h3>
                     <p className="text-gray-600 dark:text-gray-400">+91 XXXXXXXXXX </p>
-                    <p className="text-gray-600 dark:text-gray-400">+91 9380474206 (For Property Owners)</p>
+                    <p className="text-gray-600 dark:text-gray-400">+91 XXXXXXXXXX (For Property Owners)</p>
                   </div>
                 </div>
 

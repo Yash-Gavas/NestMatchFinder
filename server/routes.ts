@@ -11,6 +11,8 @@ import {
 } from "@shared/schema";
 import jwt from "jsonwebtoken";
 import { generateOtpCode, sendOtpEmail } from "./email";
+import { normalizeCity, isValidCoord } from "@shared/cities";
+import { getRoomTypes, parseRoomTypes, aggregateRoomTypes, sharingLabel } from "@shared/roomtypes";
 
 const JWT_SECRET = process.env.JWT_SECRET || "nestmatch_secret_key";
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -39,6 +41,37 @@ const authenticateToken = (req: any, res: any, next: any) => {
     next();
   });
 };
+
+// ---- shared business rules -------------------------------------------------
+// A booking "holds" a bed while it is pending or approved. Any status change that
+// moves a booking into/out of this set must adjust the property's availableBeds.
+const BED_HOLDING = ["pending", "approved"];
+const holdsBed = (status: string) => BED_HOLDING.includes(status);
+const toInt = (v: any) => (v === "" || v == null ? NaN : Math.trunc(Number(v)));
+const monthKey = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+
+// Change availableBeds by delta on the booked room type (and keep the property totals
+// in sync). Old properties without room types just use the plain counters.
+async function adjustBeds(property: any, sharing: number | null | undefined, delta: number) {
+  const types = getRoomTypes(property);
+  if (types.length > 0 && sharing != null) {
+    const next = types.map((t) =>
+      t.sharing === sharing
+        ? { ...t, availableBeds: Math.max(0, Math.min(t.totalBeds, t.availableBeds + delta)) }
+        : t
+    );
+    const agg = aggregateRoomTypes(next);
+    return storage.updateProperty(property.id, {
+      roomTypes: next,
+      totalBeds: agg.totalBeds,
+      availableBeds: agg.availableBeds,
+    } as any);
+  }
+  return storage.updateProperty(property.id, {
+    availableBeds: Math.max(0, Math.min(property.totalBeds, property.availableBeds + delta)),
+  });
+}
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // In-memory OTP store (works without DB table; cleared on restart)
@@ -437,12 +470,61 @@ export async function registerRoutes(app: Express): Promise<Server> {
             .json({ message: "Only owners can create properties" });
         }
 
-        console.log("Creating property with data:", req.body);
+        const body = req.body || {};
+        let rent = toInt(body.rent);
+        let securityDeposit = toInt(body.securityDeposit ?? 0);
+        let totalBeds = toInt(body.totalBeds);
+        let availableBeds = toInt(body.availableBeds);
+
+        // Room types (1/2/3 sharing, each with its own price and beds). The property's
+        // headline rent and bed totals are derived from them.
+        let roomTypes: any[] | null = null;
+        if (Array.isArray(body.roomTypes) && body.roomTypes.length > 0) {
+          const parsed = parseRoomTypes(body.roomTypes);
+          if (parsed.error) return res.status(400).json({ message: parsed.error });
+          roomTypes = parsed.types!;
+          ({ rent, securityDeposit, totalBeds, availableBeds } = aggregateRoomTypes(roomTypes));
+        }
+        const city = normalizeCity(body.city);
+
+        if (!String(body.name || "").trim() || !String(body.address || "").trim() || !city) {
+          return res.status(400).json({ message: "Name, address and city are required" });
+        }
+        if (!(rent > 0)) {
+          return res.status(400).json({ message: "Rent must be greater than 0" });
+        }
+        if (!(securityDeposit >= 0)) {
+          return res.status(400).json({ message: "Security deposit cannot be negative" });
+        }
+        if (!(totalBeds > 0) || !(availableBeds >= 0) || availableBeds > totalBeds) {
+          return res.status(400).json({
+            message: "Total beds must be at least 1 and available beds cannot exceed total beds",
+          });
+        }
+        const hasCoords = isValidCoord(body.latitude, body.longitude);
+        if ((body.latitude || body.longitude) && !hasCoords) {
+          return res.status(400).json({ message: "Latitude/longitude are not valid coordinates" });
+        }
 
         const propertyData = insertPropertySchema.parse({
-          ...req.body,
+          name: String(body.name).trim(),
+          description: body.description || "",
+          address: String(body.address).trim(),
+          city,
+          state: String(body.state || "").trim() || "NA",
+          pincode: String(body.pincode || "").trim() || "NA",
+          latitude: hasCoords ? String(body.latitude) : undefined,
+          longitude: hasCoords ? String(body.longitude) : undefined,
+          rent,
+          securityDeposit,
+          totalRooms: toInt(body.totalRooms) > 0 ? toInt(body.totalRooms) : null,
+          roomTypes,
+          totalBeds,
+          availableBeds,
+          gender: ["male", "female", "any"].includes(body.gender) ? body.gender : "any",
+          amenities: Array.isArray(body.amenities) ? body.amenities : [],
+          images: Array.isArray(body.images) ? body.images : [],
           ownerId: req.user.id,
-          isActive: true,
           isVerified: true,
         });
 
@@ -510,13 +592,83 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return res.status(403).json({ message: "Access denied" });
         }
 
-        const { id, ownerId, createdAt, isActive, isVerified, ...updateData } =
-          req.body;
+        // Whitelist: bed counts are changed only through the bed endpoint / bookings
+        const body = req.body || {};
+        const updateData: Record<string, any> = {};
+        for (const k of ["name", "description", "address", "state", "pincode", "amenities", "images"]) {
+          if (body[k] !== undefined) updateData[k] = body[k];
+        }
+        if (body.city !== undefined) {
+          const city = normalizeCity(body.city);
+          if (!city) return res.status(400).json({ message: "City cannot be empty" });
+          updateData.city = city;
+        }
+        const existingTypes = getRoomTypes(property);
+        if (body.roomTypes !== undefined) {
+          let merged: any[];
+          if (existingTypes.length === 0) {
+            // old property being converted: only possible while nobody holds a bed
+            if ((await storage.countBedHolders(propertyId)) > 0) {
+              return res.status(400).json({
+                message: "Resolve current booking requests and tenants before adding room types to this property",
+              });
+            }
+            const parsed = parseRoomTypes(body.roomTypes);
+            if (parsed.error) return res.status(400).json({ message: parsed.error });
+            merged = parsed.types!;
+          } else {
+            // existing types: only prices change; unknown sharings are added as new types
+            const incoming = Array.isArray(body.roomTypes) ? body.roomTypes : [];
+            merged = [...existingTypes];
+            for (const t of incoming) {
+              const sharing = toInt(t?.sharing);
+              const i = merged.findIndex((m) => m.sharing === sharing);
+              if (i >= 0) {
+                const rent = toInt(t.rent ?? merged[i].rent);
+                const dep = toInt(t.securityDeposit ?? merged[i].securityDeposit);
+                if (!(rent > 0) || !(dep >= 0)) {
+                  return res.status(400).json({ message: `${sharingLabel(sharing)}: enter a valid rent and deposit` });
+                }
+                merged[i] = { ...merged[i], rent, securityDeposit: dep };
+              } else {
+                const parsed = parseRoomTypes([t]);
+                if (parsed.error) return res.status(400).json({ message: parsed.error });
+                merged.push(parsed.types![0]);
+              }
+            }
+            const check = parseRoomTypes(merged);
+            if (check.error) return res.status(400).json({ message: check.error });
+            merged = check.types!;
+          }
+          const agg = aggregateRoomTypes(merged);
+          updateData.roomTypes = merged;
+          Object.assign(updateData, agg);
+        }
+        if (body.rent !== undefined && existingTypes.length === 0 && body.roomTypes === undefined) {
+          const rent = toInt(body.rent);
+          if (!(rent > 0)) return res.status(400).json({ message: "Rent must be greater than 0" });
+          updateData.rent = rent;
+        }
+        if (body.securityDeposit !== undefined && existingTypes.length === 0 && body.roomTypes === undefined) {
+          const dep = toInt(body.securityDeposit);
+          if (!(dep >= 0)) return res.status(400).json({ message: "Security deposit cannot be negative" });
+          updateData.securityDeposit = dep;
+        }
+        if (body.totalRooms !== undefined && toInt(body.totalRooms) > 0) {
+          updateData.totalRooms = toInt(body.totalRooms);
+        }
+        if (body.gender !== undefined) {
+          updateData.gender = ["male", "female", "any"].includes(body.gender) ? body.gender : "any";
+        }
+        if (body.latitude !== undefined || body.longitude !== undefined) {
+          if (!isValidCoord(body.latitude, body.longitude)) {
+            return res.status(400).json({ message: "Latitude/longitude are not valid coordinates" });
+          }
+          updateData.latitude = String(body.latitude);
+          updateData.longitude = String(body.longitude);
+        }
 
-        const updatedProperty = await storage.updateProperty(
-          propertyId,
-          updateData
-        );
+        const updatedProperty = await storage.updateProperty(propertyId, updateData);
         if (!updatedProperty) {
           return res.status(404).json({ message: "Property not found" });
         }
@@ -525,6 +677,78 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } catch (error) {
         console.error("Property update error:", error);
         res.status(400).json({ message: "Invalid input", error });
+      }
+    }
+  );
+
+  // Owner bed management (per room type): add a bed, remove an empty bed, or free a bed
+  app.post(
+    "/api/properties/:id/beds",
+    authenticateToken,
+    async (req: any, res: any) => {
+      try {
+        const propertyId = parseInt(req.params.id);
+        const property = await storage.getProperty(propertyId);
+        if (!property) return res.status(404).json({ message: "Property not found" });
+        if (property.ownerId !== req.user.id) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+
+        const action = req.body?.action;
+        const types = getRoomTypes(property);
+        let sharing: number | undefined;
+        let target: { totalBeds: number; availableBeds: number };
+
+        if (types.length > 0) {
+          sharing = toInt(req.body?.sharing);
+          const t = types.find((x) => x.sharing === sharing);
+          if (!t) return res.status(400).json({ message: "Choose which room type (sharing) to change" });
+          target = { totalBeds: t.totalBeds, availableBeds: t.availableBeds };
+        } else {
+          target = { totalBeds: property.totalBeds, availableBeds: property.availableBeds };
+        }
+
+        const holders = await storage.countBedHolders(propertyId, sharing);
+        let { totalBeds, availableBeds } = target;
+
+        if (action === "add") {
+          totalBeds += 1;
+          availableBeds += 1;
+        } else if (action === "free") {
+          // Only possible when the counter is lower than the real vacancy
+          if (availableBeds >= totalBeds - holders) {
+            return res.status(400).json({
+              message:
+                holders > 0
+                  ? "All empty beds are already counted as available. To free a bed that a tenant is using, remove that tenant first."
+                  : "All beds are already available.",
+            });
+          }
+          availableBeds += 1;
+        } else if (action === "remove") {
+          if (availableBeds <= 0 || totalBeds <= 1) {
+            return res.status(400).json({
+              message: "There is no empty bed to remove. Remove a tenant first.",
+            });
+          }
+          totalBeds -= 1;
+          availableBeds -= 1;
+        } else {
+          return res.status(400).json({ message: "Invalid action" });
+        }
+
+        let updates: any;
+        if (types.length > 0) {
+          const next = types.map((t) => (t.sharing === sharing ? { ...t, totalBeds, availableBeds } : t));
+          const agg = aggregateRoomTypes(next);
+          updates = { roomTypes: next, totalBeds: agg.totalBeds, availableBeds: agg.availableBeds };
+        } else {
+          updates = { totalBeds, availableBeds };
+        }
+        res.json(await storage.updateProperty(propertyId, updates));
+      } catch (error) {
+        console.error("Bed update error:", error);
+        res.status(500).json({ message: "Server error" });
       }
     }
   );
@@ -547,9 +771,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
 
         const bookings = await storage.getBookingsByProperty(propertyId);
-        const activeBookings = bookings.filter(
-          (b) => b.status === "approved" || b.status === "pending"
-        );
+        const activeBookings = bookings.filter((b) => holdsBed(b.status));
 
         if (activeBookings.length > 0) {
           return res.status(400).json({
@@ -585,28 +807,61 @@ export async function registerRoutes(app: Express): Promise<Server> {
           .json({ message: "Only users can create bookings" });
       }
 
-      const bookingData = insertBookingSchema.parse({
-        ...req.body,
-        userId: req.user.id,
-      });
-
-      console.log("Parsed booking data:", bookingData);
-
-      const property = await storage.getProperty(bookingData.propertyId);
+      const propertyId = toInt(req.body?.propertyId);
+      const property = await storage.getProperty(propertyId);
       if (!property) {
         return res.status(404).json({ message: "Property not found" });
       }
 
-      if (property.availableBeds <= 0) {
+      const types = getRoomTypes(property);
+      let type: any = null;
+      if (types.length > 0) {
+        type = types.find((t) => t.sharing === toInt(req.body?.sharing));
+        if (!type) {
+          return res.status(400).json({ message: "Please choose a room type (sharing)" });
+        }
+        if (type.availableBeds <= 0) {
+          return res.status(400).json({ message: `No beds available in ${sharingLabel(type.sharing)}` });
+        }
+      } else if (property.availableBeds <= 0) {
         return res.status(400).json({ message: "No beds available" });
       }
 
-      const booking = await storage.createBooking(bookingData);
-      console.log("Created booking:", booking);
+      const existing = await storage.getActiveBookingForUserAndProperty(
+        req.user.id,
+        property.id
+      );
+      if (existing) {
+        return res.status(409).json({
+          message: "You already have a booking request for this property",
+        });
+      }
 
-      await storage.updateProperty(property.id, {
-        availableBeds: property.availableBeds - 1,
-      });
+      const moveIn = req.body?.moveInDate ? new Date(req.body.moveInDate) : new Date();
+      const moveOut = req.body?.moveOutDate ? new Date(req.body.moveOutDate) : null;
+      if (isNaN(moveIn.getTime()) || (moveOut && isNaN(moveOut.getTime()))) {
+        return res.status(400).json({ message: "Invalid dates" });
+      }
+      if (moveOut && moveOut <= moveIn) {
+        return res.status(400).json({ message: "Move-out date must be after move-in date" });
+      }
+
+      // Rent and deposit ALWAYS come from the property, never from the client
+      const booking = await storage.createBooking({
+        userId: req.user.id,
+        propertyId: property.id,
+        status: "pending",
+        sharing: type ? type.sharing : null,
+        rent: type ? type.rent : property.rent,
+        securityDeposit: type ? type.securityDeposit : property.securityDeposit ?? 0,
+        compatibilityScore: req.body?.compatibilityScore ?? null,
+        requestedDate: new Date(),
+        moveInDate: moveIn,
+        moveOutDate: moveOut,
+      } as any);
+
+      // The bed is held from the moment the request is made
+      await adjustBeds(property, type ? type.sharing : null, -1);
 
       res.status(201).json(booking);
     } catch (error) {
@@ -683,29 +938,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(403).json({ message: "Access denied" });
       }
 
-      if (req.body.status === "approved" && booking.status !== "approved") {
-        if (property.availableBeds > 0) {
-          await storage.updateProperty(property.id, {
-            availableBeds: property.availableBeds - 1,
-          });
-        } else {
-          return res
-            .status(400)
-            .json({ message: "No available beds remaining" });
-        }
+      const next = req.body?.status;
+      if (!["approved", "rejected", "removed"].includes(next)) {
+        return res.status(400).json({ message: "Invalid status" });
       }
+      if (next === booking.status) return res.json(booking);
 
-      if (req.body.status === "rejected" && booking.status === "approved") {
-        await storage.updateProperty(property.id, {
-          availableBeds: property.availableBeds + 1,
+      const allowed: Record<string, string[]> = {
+        pending: ["approved", "rejected"],
+        approved: ["removed", "rejected"],
+      };
+      if (!(allowed[booking.status] || []).includes(next)) {
+        return res.status(400).json({
+          message: `A ${booking.status} booking cannot be changed to ${next}`,
         });
       }
 
+      // Bed accounting: pending -> approved keeps the bed held (nothing changes);
+      // leaving pending/approved (rejected / removed) gives the bed back.
+      if (holdsBed(booking.status) && !holdsBed(next)) {
+        await adjustBeds(property, booking.sharing, +1);
+      }
+
       const updatedBooking = await storage.updateBooking(bookingId, {
-        ...req.body,
-        approvedDate:
-          req.body.status === "approved" ? new Date() : booking.approvedDate,
-      });
+        status: next,
+        approvedDate: next === "approved" ? new Date() : booking.approvedDate,
+        moveOutDate: next === "removed" ? new Date() : booking.moveOutDate,
+      } as any);
 
       res.json(updatedBooking);
     } catch (error) {
@@ -733,10 +992,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return res.status(403).json({ message: "Access denied" });
         }
 
-        if (property && booking.status === "approved") {
-          await storage.updateProperty(property.id, {
-            availableBeds: property.availableBeds + 1,
-          });
+        // Cancelling a booking that held a bed gives the bed back
+        if (property && holdsBed(booking.status)) {
+          await adjustBeds(property, booking.sharing, +1);
+        }
+
+        // Keep payment history consistent: remove payments tied to this booking
+        try {
+          const { pool } = await import("./db");
+          await pool.query(`DELETE FROM rent_payments WHERE "bookingId" = $1`, [bookingId]);
+        } catch {
+          // ignore
         }
 
         const deleted = await storage.deleteBooking(bookingId);
@@ -886,13 +1152,40 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(403).json({ message: "Access denied" });
       }
 
-      const updatedUser = await storage.updateUser(userId, req.body);
+      // Only profile fields may be changed here. Never userType, isVerified, id,
+      // email or password.
+      const allowed = [
+        "firstName",
+        "lastName",
+        "name",
+        "phone",
+        "age",
+        "gender",
+        "occupation",
+        "profession",
+        "company",
+        "bio",
+        "profilePhoto",
+        "preferences",
+      ];
+      const updates: Record<string, any> = {};
+      for (const key of allowed) {
+        if (req.body && req.body[key] !== undefined) updates[key] = req.body[key];
+      }
+
+      if (Object.keys(updates).length === 0) {
+        const existing = await storage.getUser(userId);
+        if (!existing) return res.status(404).json({ message: "User not found" });
+        return res.json({ ...existing, password: undefined });
+      }
+
+      const updatedUser = await storage.updateUser(userId, updates as any);
 
       if (!updatedUser) {
         return res.status(404).json({ message: "User not found" });
       }
 
-      res.json(updatedUser);
+      res.json({ ...updatedUser, password: undefined });
     } catch (error) {
       res.status(500).json({ message: "Server error" });
     }
@@ -942,16 +1235,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   );
 
-  // Rent payment tracking routes (simple confirmation system)
+  // ---- Rent payments --------------------------------------------------------
+  // Flow: tenant marks a month as paid (cash / online) -> status "submitted"
+  //       owner approves -> "paid"   (or rejects -> "rejected", tenant may resubmit)
   app.get(
     "/api/rent-payments/user/:userId",
     authenticateToken,
     async (req: any, res: any) => {
       try {
         const userId = parseInt(req.params.userId);
-        const payments = await storage.getRentPaymentsByUser(userId);
-        res.json(payments);
+        if (req.user.id !== userId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+        res.json(await storage.getRentPaymentsByUser(userId));
       } catch (error) {
+        console.error("rent-payments user error:", error);
         res.status(500).json({ message: "Server error" });
       }
     }
@@ -963,9 +1261,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
     async (req: any, res: any) => {
       try {
         const ownerId = parseInt(req.params.ownerId);
-        const payments = await storage.getRentPaymentsByOwner(ownerId);
-        res.json(payments);
+        if (req.user.id !== ownerId) {
+          return res.status(403).json({ message: "Access denied" });
+        }
+        res.json(await storage.getRentPaymentsByOwner(ownerId));
       } catch (error) {
+        console.error("rent-payments owner error:", error);
         res.status(500).json({ message: "Server error" });
       }
     }
@@ -976,34 +1277,68 @@ export async function registerRoutes(app: Express): Promise<Server> {
     authenticateToken,
     async (req: any, res: any) => {
       try {
-        const { bookingId, amount, paymentMonth, paymentMethod, notes } =
-          req.body;
+        const bookingId = toInt(req.body?.bookingId);
+        const paymentMonth = String(req.body?.paymentMonth || "");
+        const paymentMethod = req.body?.paymentMethod;
 
-        const booking = await storage.getBooking(bookingId);
-        if (!booking) {
-          return res.status(404).json({ message: "Booking not found" });
+        if (!["cash", "online"].includes(paymentMethod)) {
+          return res.status(400).json({ message: "Payment method must be cash or online" });
+        }
+        if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(paymentMonth)) {
+          return res.status(400).json({ message: "Invalid month" });
         }
 
-        const property = await storage.getProperty(booking.propertyId);
-        if (!property) {
-          return res.status(404).json({ message: "Property not found" });
+        const booking = await storage.getBooking(bookingId);
+        if (!booking || booking.userId !== req.user.id) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+        if (booking.status !== "approved") {
+          return res.status(400).json({ message: "Rent can only be paid for an approved booking" });
+        }
+
+        // Month must be between move-in month and next month
+        const start = new Date(booking.moveInDate || booking.approvedDate || booking.createdAt);
+        const nextMonth = new Date();
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+        const lastAllowed = monthKey(start) > monthKey(nextMonth) ? monthKey(start) : monthKey(nextMonth);
+        if (paymentMonth < monthKey(start) || paymentMonth > lastAllowed) {
+          return res.status(400).json({ message: "That month is outside your stay" });
+        }
+
+        const existing = (await storage.getRentPaymentsByBooking(bookingId)).find(
+          (p: any) => p.paymentMonth === paymentMonth
+        );
+        const fields = {
+          amount: booking.rent, // always the booked rent
+          paymentDate: new Date(),
+          paymentMethod,
+          notes: req.body?.notes ? String(req.body.notes).slice(0, 300) : null,
+          status: "submitted",
+        };
+
+        if (existing) {
+          if (existing.status !== "rejected") {
+            return res.status(409).json({
+              message:
+                existing.status === "paid"
+                  ? "This month is already paid"
+                  : "This month is already waiting for the owner's approval",
+            });
+          }
+          return res.json(await storage.updateRentPayment(existing.id, fields as any));
         }
 
         const payment = await storage.createRentPayment({
           userId: booking.userId,
           propertyId: booking.propertyId,
           bookingId,
-          amount,
           paymentMonth,
-          paymentDate: new Date(),
-          paymentMethod: paymentMethod || null,
-          notes: notes || null,
-          status: "pending",
-        });
-
-        res.json(payment);
+          ...fields,
+        } as any);
+        res.status(201).json(payment);
       } catch (error) {
-        res.status(400).json({ message: "Invalid input", error });
+        console.error("rent-payment create error:", error);
+        res.status(400).json({ message: "Invalid input" });
       }
     }
   );
@@ -1014,23 +1349,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
     async (req: any, res: any) => {
       try {
         const paymentId = parseInt(req.params.id);
-        const { status } = req.body;
-
-        if (
-          !["confirmed_by_user", "confirmed_by_owner", "completed"].includes(
-            status
-          )
-        ) {
-          return res.status(400).json({ message: "Invalid status" });
+        const { status } = req.body || {};
+        if (!["paid", "rejected"].includes(status)) {
+          return res.status(400).json({ message: "Status must be paid or rejected" });
         }
 
-        const payment = await storage.updateRentPaymentStatus(paymentId, status);
-        if (payment) {
-          res.json(payment);
-        } else {
-          res.status(404).json({ message: "Payment not found" });
+        const payment = await storage.getRentPayment(paymentId);
+        if (!payment) return res.status(404).json({ message: "Payment not found" });
+
+        const property = await storage.getProperty(payment.propertyId);
+        if (!property || property.ownerId !== req.user.id) {
+          return res.status(403).json({ message: "Only the property owner can approve payments" });
         }
+        if (payment.status !== "submitted") {
+          return res.status(400).json({ message: "Only submitted payments can be reviewed" });
+        }
+
+        res.json(await storage.updateRentPaymentStatus(paymentId, status));
       } catch (error) {
+        console.error("rent-payment status error:", error);
         res.status(500).json({ message: "Server error" });
       }
     }

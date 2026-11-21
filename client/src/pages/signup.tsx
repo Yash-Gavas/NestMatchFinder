@@ -7,10 +7,12 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation, Link } from "wouter";
+import { useAuth, postLoginPath } from "@/lib/auth-context";
 
 export default function Signup() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
+  const { login } = useAuth();
 
   const [userType, setUserType] = useState<'user' | 'owner'>('user');
   const [step, setStep] = useState<'details' | 'otp'>('details');
@@ -42,17 +44,14 @@ export default function Signup() {
       if (response.ok) {
         // If backend directly logs in after signup
         if (responseData.token) {
-          localStorage.setItem('authToken', responseData.token);
-          localStorage.setItem('userType', userType);
-          localStorage.setItem('userEmail', formData.email);
-          localStorage.setItem('user', JSON.stringify(responseData.user));
+          login(responseData.token, responseData.user);
 
           toast({
             title: "Account Created",
             description: "Welcome to NestMatch! Your account has been created successfully.",
           });
 
-          setLocation(userType === 'owner' ? '/dashboard/owner' : '/dashboard/user');
+          setLocation(postLoginPath(responseData.user));
         } else {
           // Move to OTP verification step
           setStep('otp');
@@ -95,17 +94,14 @@ export default function Signup() {
       const responseData = await response.json();
 
       if (response.ok) {
-        localStorage.setItem('authToken', responseData.token);
-        localStorage.setItem('userType', userType);
-        localStorage.setItem('userEmail', formData.email);
-        localStorage.setItem('user', JSON.stringify(responseData.user));
+        login(responseData.token, responseData.user);
 
         toast({
           title: "Account Created",
           description: "Welcome to NestMatch! Your account has been created successfully.",
         });
 
-        setLocation(userType === 'owner' ? '/dashboard/owner' : '/dashboard/user');
+        setLocation(postLoginPath(responseData.user));
       } else {
         throw new Error(responseData.message || 'Invalid OTP');
       }
